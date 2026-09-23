@@ -54,9 +54,12 @@ def test_deepseek_runtime_retains_rewritten_context_and_episode_status(
     records[1]["response"]["choices"][0]["finish_reason"] = call_finish
     requests = []
 
-    def http_json(method: str, unused_url: str, unused_payload: Any, unused_timeout: float) -> dict:
+    def http_json(method: str, unused_url: str, unused_payload: Any, unused_timeout: float,
+                  admin_token: Optional[str] = None, max_response_bytes: int = 32 * 1024 * 1024) -> dict:
         """Return recorded calls through the unchanged gateway session lifecycle."""
         del unused_url, unused_payload, unused_timeout
+        assert admin_token == "controller-token"
+        assert max_response_bytes == 32 * 1024 * 1024
         requests.append(method)
         return {"policy_version": 1, "completions": records, "failure": (
             {"failure_origin": "model", "failure_reason": model_failure, "trainable": True}
@@ -67,7 +70,9 @@ def test_deepseek_runtime_retains_rewritten_context_and_episode_status(
     monkeypatch.setattr(harness, "_load_reward_callable", lambda _value: lambda _answer, _prompt: RewardResult(1.0))
     config = {"session_root": str(tmp_path), "max_turns": 2, "max_new_tokens": 8, "temperature": 1.0,
               "top_p": 1.0, "top_k": 0, "max_episode_tokens": 64, "timeout_seconds": 60}
-    program = harness.DeepSeekAgentProgram(prompt, 1, 0, "http://gateway/v1", "http://gateway", config, 99)
+    program = harness.DeepSeekAgentProgram(
+        prompt, 1, 0, "http://gateway/v1", "http://gateway", config, 99, admin_token="controller-token",
+    )
     monkeypatch.setattr(program, "_run_harness", lambda *_args: ("1", finish_reason, []))
     if terminal == "unknown":
         with pytest.raises(RuntimeError, match="unknown failure origin"):

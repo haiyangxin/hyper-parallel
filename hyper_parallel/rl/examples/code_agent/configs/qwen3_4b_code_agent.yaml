@@ -1,0 +1,185 @@
+# Stage C functional recipe; task learning and repair capability are reported separately.
+model:
+  registry_name: qwen3_4b
+  name: qwen3
+  weights_path: /models/Qwen3-4B
+  tokenizer_path: /models/Qwen3-4B
+  config_overrides: null
+
+consistency:
+  enabled: false
+
+data:
+  train_path: /results/tasks.parquet
+  test_path: /results/tasks.parquet
+  row_adapter: examples.code_agent.prepare_data:adapt_row
+  max_prompt_length: 1024
+  max_train_samples: 2
+  shuffle: false
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: true
+
+rollout:
+  engine: vllm
+  num_return_sequences: 2
+  max_new_tokens: 2048
+  ignore_eos: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  seed: 20260903
+  vllm:
+    deployment: colocated
+    data_parallel_size: 2
+    port: 18870
+    model_implementation: native
+    tensor_parallel_size: 1
+    weight_sync:
+      strategy: full_gather
+      bucket_size_mb: 128
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: true
+    batch_invariant: false
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    enable_auto_tool_choice: true
+    tool_call_parser: hermes
+    gpu_memory_utilization: 0.35
+    kv_cache_memory_bytes: 8589934592
+    max_model_len: 16384
+    block_size: 128
+    max_num_seqs: 4
+    max_num_batched_tokens: 16384
+    logprobs_mode: raw_logprobs
+    startup_timeout: 600
+    request_timeout: 600
+
+agentic:
+  runner: codex
+  interaction_mode: multi_turn
+  protocol: json_function_call
+  apply_chat_template: true
+  max_turns: 16
+  max_observation_tokens: 0
+  max_episode_tokens: 16384
+  codex:
+    executable: codex
+    version: "0.152.1"
+    model: qwen3
+    model_context_window: 14336
+    reasoning_effort: none
+    sandbox: danger-full-access
+    gateway_host: 127.0.0.1
+    gateway_public_host: 127.0.0.1
+    gateway_port: 18880
+    max_inflight_requests: 2
+    timeout_seconds: 1800
+    request_timeout: 1800
+    session_root: /results/sessions
+    task_factory: examples.code_agent.task:build_task
+    task_config:
+      run_timeout: 5
+    workspace:
+      image: sha256:12c0ec8f5b1a8024b415ecab27f26e9bb4d0d5434b175cd9ea8cfb5744d2c6da
+      max_concurrent: 2
+      output_limit_bytes: 4194304
+    max_request_bytes: 8388608
+    max_response_bytes: 67108864
+    model_instructions: |-
+      You are an autonomous coding agent repairing a Python repository.
+      Inspect existing files, edit the implementation, and execute tests using the declared tools.
+      Use exec_command with login=false for shell commands. Use write_stdin only after exec_command returns a session ID.
+      Use rg -n -F for literal code strings containing punctuation such as brackets or dots.
+      If a search fails, change the query or inspection method; do not repeat the same failed command.
+      To edit, run python /opt/hyper-codex-home/checked_patch.py with a shell heredoc containing a Codex
+      *** Begin Patch / *** End Patch block. This is a shell command, not a separate model tool.
+      Read its real exit status, changed-file hashes and diff. A byte change alone does not prove the task is fixed.
+      If the patch fails or changes no file, revise it. Reread changed lines and run the public test.
+      Once you find the relevant function, attempt a patch before rereading an entire file or exhausting the call budget.
+      Only src/*.py may change. Preserve all other repository files and use /tmp for temporary inputs.
+      Do not ask the user questions. After testing, return a concise final summary of the actual result.
+    instruction_template: |-
+      /no_think
+      {prompt}
+      Start by reading: head -v -n 120 README.md entrypoint.py public_test.py src/*.py
+      Then edit the implementation and run python public_test.py.
+      Finish with a final summary within eight tool calls, even if tests still fail.
+
+evaluation:
+  enabled: true
+  batch_size: 1
+  max_samples: 2
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  log_samples: 2
+  progress_steps: 0
+
+algorithm:
+  name: grpo
+  advantage_epsilon: 1.0e-6
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
+  clip_ratio_c: 3.0
+  kl_coef: 0.0
+  kl_type: low_var_kl
+  loss_aggregation: token-mean
+
+train:
+  max_steps: 2
+  seed: 1234
+  prompt_batch_size: 1
+  micro_batch_size: 1
+  response_mini_batch_size: 2
+  policy_update_epochs: 1
+  init_device: meta
+  comm_backend: hccl
+  learning_gate:
+    enabled: false
+    min_gradient_norm: 0.0
+    require_mixed_rewards: false
+  accelerator:
+    dp_replicate: 1
+    dp_shard: 2
+    tp: 1
+    cp: 1
+    pp: 1
+    reshard_after_forward: true
+    comm_fusion: true
+    cpu_offload: true
+    activation_checkpoint: full
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: null
+  optimizer:
+    lr: 1.0e-6
+    lr_min: 0.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    eps: 1.0e-8
+    betas: [0.9, 0.999]
+    foreach: null
+  checkpoint:
+    output_dir: /results/checkpoints
+    save_steps: 0
+    save_final: true
+    verify_reload: false
+
+logging:
+  backends: [console]
+  project_name: hyper-rl
+  experiment_name: qwen3_4b_code_agent
+  log_steps: 1
+  log_samples: 2
+  wandb:
+    mode: disabled
+    entity: null
+    directory: /results/wandb

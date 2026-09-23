@@ -523,8 +523,9 @@ class _HTTPResponse:
     def __exit__(self, *_args: Any) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self.payload
+    def read(self, size: int = -1) -> bytes:
+        """Return the requested prefix of the fixed response payload."""
+        return self.payload if size < 0 else self.payload[:size]
 
 
 @pytest.mark.parametrize("harness_name", ["codex_harness", "deepseek_harness"])
@@ -535,6 +536,8 @@ def test_harness_http_helpers_and_runtime(
     modules = _modules()
     harness = getattr(modules, harness_name)
     shared = importlib.import_module("rl.agentic.core.program_runner")
+    monkeypatch.setattr(shared.urllib.request, "build_opener", lambda *_handlers: SimpleNamespace(
+        open=shared.urllib.request.urlopen))
     monkeypatch.setattr(
         shared.urllib.request,
         "urlopen",
@@ -601,6 +604,7 @@ def test_harness_http_helpers_and_runtime(
     monkeypatch.setattr(harness, gateway_class.__name__, Gateway)
     monkeypatch.setattr(shared.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(shared.dist, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(shared.dist, "broadcast_object_list", lambda *_args, **_kwargs: None)
     runtime = runtime_class(engine, {})
     runtime.ensure_started()
     assert "start" in events and engine.errors[-1][0] is None
@@ -725,10 +729,11 @@ def test_gateway_http_routes_and_lifecycle(gateway_module: str) -> None:
         headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, Any]]:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
+        management = {"Authorization": "Bearer " + server.admin_token} if path.startswith("/internal/") else {}
         http_request = urllib.request.Request(
             base_url + path,
             data=data,
-            headers={"Content-Type": "application/json", **(headers or {})},
+            headers={"Content-Type": "application/json", **management, **(headers or {})},
             method=method,
         )
         try:
@@ -760,7 +765,7 @@ def test_gateway_http_routes_and_lifecycle(gateway_module: str) -> None:
         assert request("POST", proxy_path, {"messages": []} if is_deepseek else {"input": "q"})[0] == 502
         assert request("GET", "/internal/sessions/session")[1]["policy_version"] == 2
         assert request("DELETE", "/unknown")[0] == 404
-        assert request("DELETE", "/internal/sessions/missing")[0] == 404
+        assert request("DELETE", "/internal/sessions/missing")[0] == 200
         assert request("DELETE", "/internal/sessions/session")[0] == 200
     finally:
         server.close()
@@ -1577,7 +1582,12 @@ def test_program_run_lifecycle(
         "completions": [{"response": {"choices": []}}],
     }
 
-    def http_json(method: str, url: str, payload: Any, timeout: float) -> dict[str, Any]:
+    def http_json(method: str, url: str, payload: Any, timeout: float,
+                  admin_token: str | None = None,
+                  max_response_bytes: int = 32 * 1024 * 1024) -> dict[str, Any]:
+        """Record authenticated lifecycle calls and return the captured session."""
+        assert admin_token == "controller-test-secret"
+        assert max_response_bytes == 32 * 1024 * 1024
         requests.append((method, url, payload, timeout))
         return captured if method == "GET" else {}
 
@@ -1585,7 +1595,7 @@ def test_program_run_lifecycle(
     trajectory = SimpleNamespace(reward=1.0)
     if harness_name == "codex_harness":
         program = harness.CodexAgentProgram(
-            _prompt(), 2, 0, "http://gateway", config, 99
+            _prompt(), 2, 0, "http://gateway", config, 99, admin_token="controller-test-secret"
         )
         monkeypatch.setattr(program, "_write_codex_config", lambda *_args: None)
 
@@ -1600,7 +1610,7 @@ def test_program_run_lifecycle(
         monkeypatch.setattr(harness, "build_codex_call_trajectories", lambda **_kwargs: (trajectory,))
     else:
         program = harness.DeepSeekAgentProgram(
-            _prompt(), 2, 0, "http://gateway/v1", "http://gateway", config, 99
+            _prompt(), 2, 0, "http://gateway/v1", "http://gateway", config, 99, admin_token="controller-test-secret"
         )
         monkeypatch.setattr(program, "_run_harness", lambda *_args: ("2", "completed", []))
         monkeypatch.setattr(program, "_capture_contract_error", lambda _captured: None)
@@ -1632,6 +1642,7 @@ def test_program_factories_verify_policy_version(monkeypatch: pytest.MonkeyPatch
             episode_version=4,
             gateway_url="http://gateway/v1",
             admin_url="http://gateway",
+            admin_token="controller-test-secret",
         )
         factory_class = (
             harness.CodexProgramFactory

@@ -18,17 +18,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
 import signal
+import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
-from rl.agentic.codex.gateway import CodexGateway
+from rl.agentic.codex.gateway import CodexGateway, CompletionBudgetExhausted, REPOSITORY_COMPACT_PROMPT
 from rl.agentic.core.program_runner import (
     HarnessProgramFactory,
     HarnessRuntime,
@@ -39,12 +42,27 @@ from rl.agentic.core.program_runner import (
     request_gateway_json,
 )
 from rl.agentic.core.types import RewardResult
+from rl.agentic.envs.docker_workspace import (
+    DockerWorkspace, InvalidSubmissionError, WorkspaceOutputLimitError, WorkspaceTimeoutError, acquire_workspace_slot,
+)
+from rl.agentic.envs.model_relay import CandidateRelay
 from rl.dataset.contracts import PromptRecord, Trajectory
+
+
+_LOGGER = logging.getLogger(__name__)
 DEFAULT_CODEX_VERSION = "0.152.1"
 RewardCallable = Callable[[str, PromptRecord], float | RewardResult]
 _MODEL_METADATA_FALLBACK = re.compile(
     r"^Model metadata for `[^`]+` not found\. Defaulting to fallback metadata;"
 )
+_COMPACTION_WARNING = (
+    "Heads up: Long threads and multiple compactions can cause the model to be less accurate. "
+    "Start a new thread when possible to keep threads small and targeted."
+)
+
+
+class _CodexExecutionError(RuntimeError):
+    """CLI failed after model interaction; gateway evidence determines attribution."""
 
 
 def build_codex_trajectory(
@@ -98,7 +116,16 @@ def build_codex_call_trajectories(
         reward_components=reward_components,
         max_episode_tokens=max_episode_tokens,
         metadata=metadata,
+        status_resolver=_repository_call_status,
     )
+
+
+def _repository_call_status(_traces: Sequence[Mapping[str, Any]],
+                            metadata: Mapping[str, Any]) -> tuple[bool, str] | None:
+    """Mark every call in a controller-validated repository budget episode as truncated."""
+    if metadata.get("repository_budget_truncated") is True:
+        return True, "max_completions"
+    return None
 
 
 def _toml_string(value: str) -> str:
@@ -140,7 +167,7 @@ def _classify_codex_events(
         ):
             continue
         message = str(item.get("message", ""))
-        if _MODEL_METADATA_FALLBACK.search(message):
+        if _MODEL_METADATA_FALLBACK.search(message) or message == _COMPACTION_WARNING:
             diagnostics.append(event)
         else:
             failed_events.append(event)
@@ -152,8 +179,11 @@ def _http_json(
     url: str,
     payload: Optional[Mapping[str, Any]],
     timeout: float,
+    admin_token: str | None = None,
+    *, max_response_bytes: int = 32 * 1024 * 1024,
 ) -> dict[str, Any]:
-    return request_gateway_json("Codex", method, url, payload, timeout)
+    return request_gateway_json("Codex", method, url, payload, timeout,
+                                admin_token=admin_token, max_response_bytes=max_response_bytes)
 
 
 class CodexRuntime(HarnessRuntime):
@@ -167,57 +197,310 @@ class CodexRuntime(HarnessRuntime):
         )
 
 
+@dataclass(frozen=True)
+class RepositoryInferenceResult:
+    """A scored repository inference episode, never a training trajectory."""
+
+    session_id: str
+    artifact_dir: Path
+    final_answer: str
+    diagnostics: list
+    captured: Mapping[str, Any]
+    reward: RewardResult
+    generation_seconds: float
+
+
 class CodexAgentProgram:
-    """Run one complete Codex tool loop and return one immutable trajectory."""
+    """Run one Codex tool loop with separate training and repository inference results."""
 
     def __init__(
         self,
         prompt: PromptRecord,
-        policy_version: int,
+        policy_version: int | None,
         sample_index: int,
         gateway_url: str,
         config: Mapping[str, Any],
         end_of_turn_token_id: Optional[int],
+        admin_url: str | None = None,
+        admin_token: str | None = None,
+        inference_only: bool = False,
     ) -> None:
         """Capture the episode identity and immutable harness settings."""
+        if not isinstance(inference_only, bool):
+            raise ValueError("inference_only must be a boolean")
+        if inference_only and policy_version is not None:
+            raise ValueError("Inference must not claim a policy version")
+        if not inference_only and (not isinstance(policy_version, int)
+                                   or isinstance(policy_version, bool) or policy_version < 0):
+            raise ValueError("Training requires a non-negative policy version")
+        self.inference_only = inference_only
         self.prompt = prompt
         self.policy_version = policy_version
         self.sample_index = sample_index
         self.gateway_url = gateway_url.rstrip("/")
+        self.admin_url = (admin_url or gateway_url).rstrip("/")
+        self.admin_token = admin_token
         self.config = dict(config)
         self.end_of_turn_token_id = end_of_turn_token_id
-        self.reward_callable = _load_reward_callable(self.config.get("reward_callable"))
+        task_factory = self.config.get("task_factory")
+        if inference_only and not task_factory:
+            raise ValueError("Inference requires an isolated repository task")
+        if bool(task_factory) == bool(self.config.get("reward_callable")):
+            raise ValueError("Codex requires exactly one of task_factory and reward_callable")
+        if task_factory and (not admin_url or not admin_token):
+            raise ValueError("Repository Codex requires controller admin_url and admin_token")
+        self.task_factory = (load_reward_callable(task_factory, "agentic.codex.task_factory", "Codex task")
+                             if task_factory else None)
+        self.reward_callable = None if task_factory else _load_reward_callable(self.config.get("reward_callable"))
 
     async def run(self) -> tuple[Trajectory, ...]:
         """Run Codex, fetch the captured network trace, score it, and convert it."""
+        if self.inference_only:
+            raise ValueError("Inference-only programs cannot return training trajectories; use run_inference")
+        return await self._run_episode()
+
+    async def run_inference(self) -> RepositoryInferenceResult:
+        """Run the shared repository lifecycle without constructing training data."""
+        if not self.inference_only:
+            raise ValueError("run_inference requires an inference-only program")
+        return await self._run_episode()
+
+    async def _run_episode(self) -> tuple[Trajectory, ...] | RepositoryInferenceResult:
         session_id = uuid.uuid4().hex
         artifact_dir, workspace_dir, codex_home = self._prepare_directories(session_id)
         timeout = float(self.config.get("request_timeout", 600.0))
-        await asyncio.to_thread(
-            _http_json,
-            "POST",
-            f"{self.gateway_url}/internal/sessions",
-            {
+        try:
+            await self._admin_request("POST", "/internal/sessions", {
                 "session_id": session_id,
                 "policy_version": self.policy_version,
                 "artifact_dir": str(artifact_dir),
-                "max_completions": int(self.config["max_turns"]),
+                "max_completions": (self.config.get("max_turns") if self.inference_only
+                                    else int(self.config["max_turns"])),
+                "inference_only": self.inference_only,
                 "generation": self._generation_settings(),
-            },
-            timeout,
-        )
-        try:
+                "repository_task": self.task_factory is not None,
+            }, timeout)
+            if self.task_factory is not None:
+                capacity = int(self.config["workspace"].get("max_concurrent", 1))
+                async with acquire_workspace_slot(artifact_dir.parent / ".workspace-slots", capacity, timeout):
+                    return await self._run_repository(session_id, artifact_dir, codex_home, timeout)
             return await self._run_registered(
                 session_id, artifact_dir, workspace_dir, codex_home, timeout
             )
         finally:
-            await asyncio.to_thread(
-                _http_json,
-                "DELETE",
-                f"{self.gateway_url}/internal/sessions/{session_id}",
-                None,
-                timeout,
+            original_error = sys.exc_info()[1]
+            try:
+                await self._admin_request("DELETE", f"/internal/sessions/{session_id}", None, timeout)
+            except Exception:
+                if original_error is None:
+                    raise
+                _LOGGER.exception("Codex session cleanup failed while preserving original failure")
+
+    async def _admin_request(self, method: str, path: str, payload: Mapping | None,
+                             timeout: float) -> dict[str, Any]:
+        """Settle an in-flight controller request before cancellation cleanup."""
+        request = asyncio.create_task(asyncio.to_thread(
+            _http_json, method, self.admin_url + path, payload, timeout, self.admin_token,
+            max_response_bytes=int(self.config.get("max_response_bytes", 32 * 1024 * 1024)),
+        ))
+        try:
+            return await asyncio.shield(request)
+        except asyncio.CancelledError:
+            await asyncio.gather(request, return_exceptions=True)
+            raise
+
+    async def _run_repository(self, session_id: str, artifact_dir: Path,
+                              codex_home: Path, timeout: float) -> tuple[Trajectory, ...] | RepositoryInferenceResult:
+        """Run isolated repository tools and score only a frozen submission."""
+        settings = dict(self.config["workspace"])
+        settings.pop("max_concurrent", None)
+        settings.pop("output_limit_bytes", None)
+        run_id = settings.pop("run_id", self.config.get("run_id", session_id))
+        task_config = dict(self.config.get("task_config", {}))
+        if task_config.get("image", settings["image"]) != settings["image"]:
+            raise ValueError("Repository candidate and grader must use the same pinned image")
+        task_config["image"] = settings["image"]
+        task_config["run_id"] = run_id
+        task = self.task_factory(self.prompt, task_config)
+        image = getattr(task, "workspace_image", settings["image"])
+        if not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
+            raise ValueError("Repository task workspace_image must be a fixed sha256 image ID")
+        settings["image"] = image
+        workspace = DockerWorkspace(**settings, network="none", name_prefix="hyper-repository-candidate",
+                                    run_id=task_config["run_id"])
+        relay = CandidateRelay(workspace, self.gateway_url, session_id, timeout,
+                               int(self.config.get("max_request_bytes", 8 * 1024 * 1024)),
+                               int(self.config.get("max_response_bytes", 32 * 1024 * 1024)),
+                               admin_url=self.admin_url, admin_token=self.admin_token,
+                               inference_only=self.inference_only)
+        started = time.perf_counter()
+        try:
+            await workspace.start()
+            await task.prepare(workspace)
+            model_url = await relay.start()
+            self._write_codex_config(codex_home, session_id, gateway_url=model_url,
+                                     runtime_home=Path("/opt/hyper-codex-home"))
+            shutil.copyfile(Path(__file__).with_name("checked_patch.py"), codex_home / "checked_patch.py")
+            await workspace.copy_in(codex_home, "/opt/hyper-codex-home")
+            alias = await workspace.exec(["ln", "-s", "/opt/codex/bin/codex",
+                                          "/opt/hyper-codex-home/apply_patch"], cwd="/")
+            if alias.returncode:
+                raise RuntimeError("Cannot install the candidate's checked patch command")
+            await self._validate_container_version(workspace)
+            execution_error = None
+            final_answer, diagnostics = "", []
+            budget_termination = None
+            try:
+                final_answer, diagnostics, budget_termination = await self._run_repository_cli(
+                    workspace, relay, session_id, artifact_dir, model_url,
+                )
+            except _CodexExecutionError as error:
+                execution_error = error
+            # Transport failure takes precedence even when the model also exhausted its budget.
+            await relay.close()
+            captured = await self._admin_request("GET", f"/internal/sessions/{session_id}", None, timeout)
+            failure_reward = self._captured_failure(captured, execution_error)
+            if budget_termination is not None:
+                if (failure_reward is not None or captured.get("termination") != budget_termination
+                        or budget_termination.get("policy_version") != self.policy_version
+                        or budget_termination.get("limit") != int(self.config["max_turns"])
+                        or len(captured.get("completions", [])) != budget_termination["limit"]):
+                    raise RuntimeError("Repository budget termination differs from the captured session")
+            await workspace.stop()
+            if failure_reward is not None:
+                reward = failure_reward
+            else:
+                if execution_error is not None:
+                    raise execution_error
+                try:
+                    archive = await workspace.export(artifact_dir / "submission.tar")
+                except InvalidSubmissionError as error:
+                    reward = RewardResult(0.0, {"success": 0.0},
+                                          {"status": "invalid_submission", "reason": str(error)})
+                else:
+                    reward = await task.evaluate(archive)
+                if not isinstance(reward, RewardResult):
+                    raise TypeError("Repository task.evaluate must return RewardResult")
+            if budget_termination is not None:
+                reward = RewardResult(reward.value, reward.components,
+                                      {**reward.metadata, "budget_termination": budget_termination,
+                                       "repository_budget_truncated": True})
+            if self.inference_only:
+                return RepositoryInferenceResult(session_id, artifact_dir, final_answer, diagnostics, captured,
+                                                 reward, time.perf_counter() - started)
+            return self._build_rows(session_id, artifact_dir, Path("/workspace"), started,
+                                    final_answer, diagnostics, captured, reward)
+        finally:
+            original_error = sys.exc_info()[1]
+            cleanup = asyncio.create_task(self._close_repository(relay, workspace))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await asyncio.gather(cleanup, return_exceptions=True)
+                raise
+            except Exception:
+                if original_error is None:
+                    raise
+                _LOGGER.exception("Repository cleanup failed while preserving original error")
+
+    @staticmethod
+    async def _close_repository(relay: CandidateRelay, workspace: DockerWorkspace) -> None:
+        try:
+            await relay.close()
+        finally:
+            await workspace.close()
+
+    async def _run_repository_cli(self, workspace: DockerWorkspace, relay: CandidateRelay,
+                                  session_id: str, artifact_dir: Path, model_url: str) -> tuple[str, list, dict | None]:
+        """Drain a confirmed budget response before actively stopping the candidate CLI."""
+        expected_stop = asyncio.Event()
+        expected_budget = {}
+        execution = asyncio.create_task(self._run_container_codex(
+            workspace, session_id, artifact_dir, expected_stop=expected_stop, expected_budget=expected_budget,
+        ))
+        budget = asyncio.create_task(relay.budget_exhausted.wait())
+        try:
+            await asyncio.wait((execution, budget), return_when=asyncio.FIRST_COMPLETED)
+            if execution.done():
+                answer, diagnostics = await execution
+                return answer, diagnostics, relay.budget_termination if relay.budget_exhausted.is_set() else None
+            await relay.close()
+            if execution.done():
+                answer, diagnostics = await execution
+                return answer, diagnostics, relay.budget_termination
+            expected_budget.update(termination=relay.budget_termination, url=model_url.rstrip("/") + "/responses")
+            expected_stop.set()
+            await workspace.stop()
+            answer, diagnostics = await execution
+            return answer, diagnostics, relay.budget_termination
+        finally:
+            for task in (budget, execution):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(budget, execution, return_exceptions=True)
+
+    async def _validate_container_version(self, workspace: DockerWorkspace) -> None:
+        result = await workspace.exec([str(self.config.get("executable", "codex")), "--version"],
+                                      timeout=30, output_limit_bytes=4096)
+        expected = str(self.config.get("version", DEFAULT_CODEX_VERSION))
+        installed = result.stdout or result.stderr
+        if result.returncode or re.search(rf"(?<!\d){re.escape(expected)}(?!\d)", installed) is None:
+            raise RuntimeError(f"Container Codex version mismatch: expected {expected}, got {installed.strip()!r}")
+
+    async def _run_container_codex(self, workspace: DockerWorkspace, session_id: str,
+                                   artifact_dir: Path, *, expected_stop: asyncio.Event | None = None,
+                                   expected_budget: dict | None = None,
+                                   ) -> tuple[str, list[dict[str, Any]]]:
+        environment = {"HOME": "/opt/hyper-codex-home", "CODEX_HOME": "/opt/hyper-codex-home",
+                       "OPENAI_API_KEY": session_id, "PYTHONDONTWRITEBYTECODE": "1",
+                       "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
+        try:
+            result = await workspace.exec(
+                self._codex_command(), env=environment,
+                timeout=float(self.config.get("timeout_seconds", 1800)),
+                output_limit_bytes=int(self.config["workspace"].get("output_limit_bytes", 4 * 1024 * 1024)),
+                controller_stop=expected_stop,
             )
+        except (WorkspaceOutputLimitError, WorkspaceTimeoutError) as error:
+            self._save_container_output(artifact_dir, error.result)
+            raise
+        self._save_container_output(artifact_dir, result)
+        final_answer, diagnostics, failures = _classify_codex_events(result.stdout.splitlines())
+        if expected_stop is not None and expected_stop.is_set() and result.returncode in (137, 143):
+            if expected_budget:
+                message = str(CompletionBudgetExhausted(expected_budget["termination"]))
+                pattern = (r"Reconnecting\.\.\. [1-5]/5 \(unexpected status 409 Conflict: "
+                           + re.escape(message) + r", url: " + re.escape(expected_budget["url"]) + r"\)")
+                retry_events = [event for event in failures if event.get("type") == "error"
+                                and re.fullmatch(pattern, str(event.get("message", "")))]
+                diagnostics.extend(retry_events)
+                failures = [event for event in failures if event not in retry_events]
+            if not failures:
+                return final_answer, diagnostics
+        if result.returncode or failures or not final_answer:
+            raise _CodexExecutionError(f"Container Codex did not complete cleanly; see {artifact_dir}")
+        return final_answer, diagnostics
+
+    @staticmethod
+    def _save_container_output(artifact_dir: Path, result: Any) -> None:
+        (artifact_dir / "codex-events.jsonl").write_text(result.stdout, encoding="utf-8")
+        (artifact_dir / "codex-stderr.log").write_text(result.stderr, encoding="utf-8")
+
+    def _captured_failure(self, captured: Mapping[str, Any],
+                          execution_error: Exception | None) -> RewardResult | None:
+        if captured.get("inference_only", False) is not self.inference_only:
+            raise RuntimeError("Codex gateway returned a different execution mode")
+        if captured.get("policy_version") != self.policy_version:
+            raise RuntimeError("Codex gateway returned a different policy version")
+        failure = captured.get("failure")
+        if failure is None:
+            return None
+        if self.inference_only:
+            raise RuntimeError(f"Codex inference protocol or infrastructure failure: {failure}") from execution_error
+        if (not isinstance(failure, Mapping) or failure.get("failure_origin") != "model"
+                or failure.get("trainable") is not True):
+            raise RuntimeError(f"Codex gateway reported an untrainable failure: {failure}") from execution_error
+        return RewardResult(0.0, {"outcome": 0.0}, dict(failure))
 
     async def _run_registered(
         self,
@@ -241,28 +524,23 @@ class CodexAgentProgram:
                 raise RuntimeError(f"Codex exited with status {return_code}; see {artifact_dir}")
         except RuntimeError as error:
             execution_error = error
-        captured = await asyncio.to_thread(
-            _http_json,
-            "GET",
-            f"{self.gateway_url}/internal/sessions/{session_id}",
-            None,
-            timeout,
-        )
-        if captured.get("policy_version") != self.policy_version:
-            raise RuntimeError("Codex gateway returned a different policy version")
-        failure = captured.get("failure")
-        if failure is not None:
-            if (not isinstance(failure, Mapping) or failure.get("failure_origin") != "model"
-                    or failure.get("trainable") is not True):
-                raise RuntimeError(f"Codex gateway reported an untrainable failure: {failure}") from execution_error
-            reward_result = RewardResult(0.0, {"outcome": 0.0}, dict(failure))
-        else:
+        captured = await self._admin_request("GET", f"/internal/sessions/{session_id}", None, timeout)
+        reward_result = self._captured_failure(captured, execution_error)
+        if reward_result is None:
             if execution_error is not None:
                 raise execution_error
             reward_result = self.reward_callable(final_answer, self.prompt)
             if not isinstance(reward_result, RewardResult):
                 reward_value = float(reward_result)
                 reward_result = RewardResult(reward_value, {"outcome": reward_value})
+        return self._build_rows(session_id, artifact_dir, workspace_dir, started, final_answer,
+                                diagnostics, captured, reward_result)
+
+    def _build_rows(self, session_id: str, artifact_dir: Path, workspace_dir: Path, started: float,
+                    final_answer: str, diagnostics: list, captured: Mapping,
+                    reward_result: RewardResult) -> tuple[Trajectory, ...]:
+        if self.inference_only:
+            raise ValueError("Inference results cannot be converted to training trajectories")
         return build_codex_call_trajectories(
             prompt=self.prompt,
             policy_version=self.policy_version,
@@ -289,6 +567,8 @@ class CodexAgentProgram:
 
     def _generation_settings(self) -> dict[str, Any]:
         """Pin every hidden Codex model call to the rollout sampling contract."""
+        if self.inference_only:
+            return dict(self.config.get("generation", {}))
         return harness_generation_settings(
             self.config, self.prompt.prompt_id, self.policy_version, self.sample_index
         )
@@ -314,15 +594,33 @@ class CodexAgentProgram:
         codex_home.mkdir()
         return artifact_dir, workspace_dir, codex_home
 
-    def _write_codex_config(self, codex_home: Path, session_id: str) -> None:
+    def _write_codex_config(self, codex_home: Path, session_id: str, *, gateway_url: str | None = None,
+                            runtime_home: Path | None = None) -> None:
         """Write the isolated provider and tool configuration for this session."""
-        lines = [
-            'model_provider = "hyper_rl"',
-            'web_search = "disabled"',
+        if self.task_factory is not None and self.config.get("mcp_servers"):
+            raise ValueError("Repository Codex tasks expose only exec_command and write_stdin, not MCP servers")
+        lines = ['model_provider = "hyper_rl"', 'web_search = "disabled"']
+        if self.task_factory is not None:
+            # CLI 0.152.1 caps unknown-model tool history at 10,000 bytes, hiding source in the middle.
+            lines.append("tool_output_token_limit = 10000")
+            context_window = self.config.get("model_context_window")
+            if (not isinstance(context_window, int) or isinstance(context_window, bool) or context_window <= 0):
+                raise ValueError("agentic.codex.model_context_window must be a positive integer")
+            lines.append(f"model_context_window = {context_window}")
+            lines.append(f"compact_prompt = {_toml_string(REPOSITORY_COMPACT_PROMPT)}")
+        instructions = self.config.get("model_instructions")
+        if instructions is not None:
+            if not isinstance(instructions, str) or not instructions.strip():
+                raise ValueError("agentic.codex.model_instructions must be a non-empty string when configured")
+            filename = "model-instructions.md"
+            (codex_home / filename).write_text(instructions, encoding="utf-8")
+            instructions_path = (runtime_home or codex_home.resolve()) / filename
+            lines.append(f"model_instructions_file = {_toml_string(str(instructions_path))}")
+        lines.extend([
             "",
             "[model_providers.hyper_rl]",
             'name = "Hyper-RL local policy"',
-            f"base_url = {_toml_string(self.gateway_url)}",
+            f"base_url = {_toml_string(gateway_url or self.gateway_url)}",
             'env_key = "OPENAI_API_KEY"',
             'wire_api = "responses"',
             "requires_openai_auth = true",
@@ -337,6 +635,23 @@ class CodexAgentProgram:
             "browser_use = false",
             "computer_use = false",
             "image_generation = false",
+        ])
+        if self.task_factory is not None:
+            lines.extend([
+                "view_image = false",
+                "goals = false",
+                "default_mode_request_user_input = false",
+                "",
+                "[tools.experimental_request_user_input]",
+                "enabled = false",
+                "",
+                "[skills]",
+                "include_instructions = false",
+                "",
+                "[skills.bundled]",
+                "enabled = false",
+            ])
+        lines.extend([
             "",
             "[analytics]",
             "enabled = false",
@@ -346,7 +661,7 @@ class CodexAgentProgram:
             "",
             "[otel]",
             'exporter = "none"',
-        ]
+        ])
         for server in self.config.get("mcp_servers", []):
             if not isinstance(server, Mapping):
                 raise ValueError("Every Codex MCP server configuration must be a mapping")
@@ -573,6 +888,7 @@ class CodexProgramFactory(HarnessProgramFactory):
     """Create policy-identity-bound Codex programs for ProgramAgentRunner."""
 
     program_type = CodexAgentProgram
+    include_admin_url = True
     label = "Codex"
 
 

@@ -15,7 +15,9 @@
 """Process-isolated vLLM rollout adapter."""
 import asyncio
 import json
+import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -24,6 +26,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from urllib import error as urllib_error
@@ -53,6 +56,8 @@ from rl.roles.weight_sync import (
     synchronized_call,
 )
 from rl.roles.weight_sync.config import resolve_weight_sync_config
+
+logger = logging.getLogger(__name__)
 
 _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "RANK",
@@ -124,6 +129,145 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         self._async_session: Optional[Any] = None
         self._async_connection_limit = 0
         self._async_startup_error: Optional[BaseException] = None
+        self._process_monitor_stop = threading.Event()
+        self._process_monitor: Optional[threading.Thread] = None
+        self._process_diagnostic_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._ready = False
+        self._last_process_resources: Optional[dict[str, Any]] = None
+        self._exit_diagnostics: Optional[dict[str, Any]] = None
+
+    @staticmethod
+    def _memory_cgroup_directory(membership: str, mountinfo: str) -> Optional[tuple[Path, bool]]:
+        """Map one memory membership through the actual mount root, never through an assumed host root."""
+        _, controllers, location = membership.split(":", 2)
+        unified = controllers == ""
+        if not unified and "memory" not in controllers.split(","):
+            return None
+        group = Path(location)
+        if not group.is_absolute() or ".." in group.parts:
+            return None
+        candidates = []
+        for line in mountinfo.splitlines():
+            before, separator, after = line.partition(" - ")
+            fields, filesystem = before.split(), after.split()
+            if not separator or len(fields) < 6 or len(filesystem) < 3:
+                continue
+            if unified:
+                matches = filesystem[0] == "cgroup2"
+            else:
+                matches = filesystem[0] == "cgroup" and "memory" in filesystem[2].split(",")
+            if not matches:
+                continue
+            mount_root, mountpoint = (
+                Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value))
+                for value in (fields[3], fields[4])
+            )
+            if (not mount_root.is_absolute() or not mountpoint.is_absolute()
+                    or ".." in mount_root.parts or ".." in mountpoint.parts):
+                continue
+            try:
+                relative = group.relative_to(mount_root)
+            except ValueError:
+                continue
+            candidates.append((len(mount_root.parts), mountpoint / relative))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1], unified
+
+    @staticmethod
+    def _resource_snapshot(pid: int) -> dict[str, Any]:
+        """Read bounded process/host memory fields and available cgroup counters, without device queries."""
+        snapshot: dict[str, Any] = {"sampled_at_utc": datetime.now(timezone.utc).isoformat()}
+        snapshot["cgroup_memory"] = {"unavailable": "no_visible_memory_controller"}
+        sources = {
+            "process_status": (Path(f"/proc/{pid}/status"), {"State", "VmRSS", "VmHWM", "VmPeak", "Threads"}),
+            "host_memory": (Path("/proc/meminfo"), {"MemAvailable", "MemFree", "SwapFree"}),
+        }
+        for name, (path, keys) in sources.items():
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    lines = handle.read(16384).splitlines()
+                snapshot[name] = {key: value.strip() for line in lines if ":" in line
+                                  for key, value in [line.split(":", 1)] if key in keys}
+            except (OSError, UnicodeError) as error:
+                snapshot[name] = {"unavailable": type(error).__name__}
+        try:
+            with Path(f"/proc/{pid}/cgroup").open(encoding="utf-8") as handle:
+                memberships = handle.read(16384).splitlines()
+            with Path("/proc/self/mountinfo").open(encoding="utf-8") as handle:
+                mountinfo = handle.read(262144)
+            for membership in memberships:
+                mapping = _VLLMHTTPClient._memory_cgroup_directory(membership, mountinfo)
+                if mapping is None:
+                    continue
+                directory, unified = mapping
+                snapshot["cgroup_memory_path"] = str(directory)
+                if unified:
+                    names = ("memory.current", "memory.max", "memory.events")
+                else:
+                    names = ("memory.usage_in_bytes", "memory.limit_in_bytes", "memory.failcnt", "memory.oom_control")
+                counters = {}
+                for name in names:
+                    try:
+                        with (directory / name).open(encoding="utf-8") as handle:
+                            counters[name] = handle.read(4096).strip()
+                    except (OSError, UnicodeError) as error:
+                        counters[name] = {"unavailable": type(error).__name__}
+                snapshot["cgroup_memory"] = counters
+                break
+        except (OSError, ValueError) as error:
+            snapshot["cgroup_memory"] = {"unavailable": type(error).__name__}
+        return snapshot
+
+    def _observe_process(self, *, sample_resources: bool = False) -> Optional[int]:
+        """Record one parent exit atomically; child-worker cause remains explicitly unknown."""
+        with self._process_diagnostic_lock:
+            process = self._process
+            if process is None:
+                return None
+            return_code = process.poll()
+            if return_code is None:
+                if sample_resources:
+                    self._last_process_resources = self._resource_snapshot(process.pid)
+                return None
+            if self._exit_diagnostics is None:
+                pid = getattr(process, "pid", None)
+                self._exit_diagnostics = {
+                    "event": "vllm_owned_process_exit", "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "process_role": "api_parent", "pid": pid, "return_code": return_code,
+                    "parent_signal_number": -return_code if return_code < 0 else None,
+                    "child_worker_signal": "unknown", "shutdown_requested": self._shutdown_requested,
+                    "phase": "shutdown" if self._shutdown_requested else ("runtime" if self._ready else "startup"),
+                    "last_alive_resources": self._last_process_resources,
+                    "exit_observation_resources": (self._resource_snapshot(pid) if pid is not None
+                                                   else {"unavailable": "pid_not_available"}),
+                }
+                level = logging.INFO if self._shutdown_requested else logging.ERROR
+                try:
+                    logger.log(level, "vLLM process diagnostic: %s", json.dumps(self._exit_diagnostics, sort_keys=True))
+                except Exception:  # pylint: disable=W0718  # Diagnostic sinks must not prevent process cleanup.
+                    # Retain the in-memory record even when the diagnostic sink fails; preserve the process error.
+                    pass
+            return return_code
+
+    def start_process_monitor(self) -> None:
+        """Observe owned-process exit even while the rollout service sleeps during training."""
+        if self._process is None or self._process_monitor is not None:
+            return
+
+        def monitor() -> None:
+            """Poll cheaply each second and retain one live resource sample every five seconds."""
+            tick = 0
+            while not self._process_monitor_stop.is_set():
+                if self._observe_process(sample_resources=tick % 5 == 0) is not None:
+                    return
+                tick += 1
+                self._process_monitor_stop.wait(1)
+
+        thread = threading.Thread(target=monitor, name="hyper-rl-vllm-process-monitor", daemon=True)
+        thread.start()
+        self._process_monitor = thread
 
     async def _create_async_session(self, connection_limit: int) -> None:
         """Create the persistent generation transport on its owning event loop."""
@@ -232,6 +376,7 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         payload: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         """Execute one generation request through the persistent connection pool."""
+        self._raise_if_owned_process_exited()
         aiohttp = _load_aiohttp()
         session = self._async_session
         if session is None:
@@ -242,6 +387,7 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 body = await response.read()
                 status = response.status
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            self._raise_if_owned_process_exited()
             raise RuntimeError(f"vLLM HTTP {method} {route} failed: {error}") from error
         if status >= 400:
             message = body.decode("utf-8", errors="replace")
@@ -277,6 +423,7 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         base_url: Optional[str] = None,
         request_headers: Optional[Mapping[str, str]] = None,
     ) -> dict[str, Any]:
+        self._raise_if_owned_process_exited()
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         headers = {} if data is None else {"Content-Type": "application/json"}
         if request_headers is not None:
@@ -294,11 +441,13 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
             ) as response:
                 body = response.read()
         except urllib_error.HTTPError as error:
+            self._raise_if_owned_process_exited()
             body = error.read().decode("utf-8", errors="replace")
             raise RuntimeError(
                 f"vLLM HTTP {method} {route} failed with status {error.code}: {body}"
             ) from error
         except (urllib_error.URLError, TimeoutError) as error:
+            self._raise_if_owned_process_exited()
             raise RuntimeError(f"vLLM HTTP {method} {route} failed: {error}") from error
         if not body:
             return {}
@@ -324,18 +473,20 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 time.sleep(1)
                 continue
             self._raise_if_owned_process_exited()
+            self._ready = True
             return
         raise RuntimeError(
             f"vLLM server did not become ready within {startup_timeout} seconds: {last_error}"
         )
 
     def _raise_if_owned_process_exited(self) -> None:
-        """Fail immediately when the server process exits during startup."""
-        if self._process is None:
-            return
-        return_code = self._process.poll()
+        """Fail on an owned parent exit without changing infrastructure-failure propagation."""
+        return_code = self._observe_process()
         if return_code is not None:
-            raise RuntimeError(f"vLLM server exited during startup with code {return_code}")
+            phase = "runtime" if self._ready else "startup"
+            raise RuntimeError(
+                f"vLLM server exited during {phase} with code {return_code}; see parent process diagnostic"
+            )
 
     def _completion_payload(
         self,
@@ -601,6 +752,20 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
 
     def close(self) -> None:
         """Terminate the server and all EngineCore descendants."""
+        self._observe_process()
+        with self._process_diagnostic_lock:
+            self._shutdown_requested = True
+        try:
+            self._close_owned_process()
+        finally:
+            self._process_monitor_stop.set()
+            if self._process_monitor is not None:
+                self._process_monitor.join(timeout=2)
+                if self._process_monitor.is_alive():
+                    logger.warning("vLLM process diagnostic monitor did not stop within two seconds")
+
+    def _close_owned_process(self) -> None:
+        """Keep existing process-group cleanup semantics while recording the owned parent's final state."""
         runtime_error = None
         try:
             self._close_async_runtime()
@@ -615,6 +780,7 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         try:
             os.killpg(process_group_id, signal.SIGTERM)
         except ProcessLookupError as error:
+            self._observe_process()
             self._process = None
             if runtime_error is not None:
                 raise runtime_error from error
@@ -631,6 +797,7 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         except RuntimeError:
             self._kill_process_group(process_group_id)
             self._wait_process_group_exit(process_group_id)
+        self._observe_process()
         self._process = None
         if runtime_error is not None:
             raise runtime_error
@@ -971,6 +1138,7 @@ class VLLMGenerationEngine:
             request_timeout=float(self._config.get("request_timeout", 600)),
         )
         try:
+            client.start_process_monitor()
             client.wait_ready(float(self._config.get("startup_timeout", 300)))
         except Exception:
             client.close()

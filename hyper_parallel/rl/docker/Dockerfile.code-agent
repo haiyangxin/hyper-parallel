@@ -1,0 +1,39 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+
+ARG BASE_IMAGE=sha256:7ef77d7254dc0c834d27979022d784d8f745c6ca544ca632b2ccfda847a75f63
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/sh", "-c"]
+ENV PATH=/opt/codex/bin:/usr/local/python3.12.13/bin:/usr/local/bin:/usr/bin:/bin \
+    HOME=/opt/hyper-agent-home \
+    CODEX_HOME=/opt/hyper-codex-home \
+    PYTHONPATH="" \
+    LD_LIBRARY_PATH=/usr/local/python3.12.13/lib \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Candidate login shells must not initialize training devices or read old sources.
+RUN printf '%s\n' \
+        'export PATH=/opt/codex/bin:/usr/local/python3.12.13/bin:/usr/local/bin:/usr/bin:/bin' \
+        > /etc/profile \
+    && rm -rf /workspace \
+    && mkdir -p /workspace /opt/hyper-agent-home /opt/hyper-codex-home \
+    && chmod 700 /opt/hyper-agent-home /opt/hyper-codex-home \
+    && test "$(codex --version)" = 'codex-cli 0.152.1' \
+    && python -I -c 'import json, pathlib, subprocess'
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["/bin/sleep", "infinity"]

@@ -50,6 +50,16 @@ Load the affected product contract rather than every RL document.
   External tool attribution uses the pinned Hermes parser evidence: infrastructure or unknown failures reject the update,
   while verified malformed model actions remain in the episode. See the
   [agent contract](../../hyper_parallel/rl/docs/agentic_rl.md) for budgets, shutdown and support boundaries.
+- Repository Code Agent uses isolated Docker candidate and grader workspaces, a controller-owned model relay,
+  independent artifact grading, and the existing per-call episode GRPO path. The two controlled repositories and two
+  SWE-bench cases establish functional coverage only, not general benchmark performance or learning. See the
+  [repository example](../../hyper_parallel/rl/examples/code_agent/README.md) and
+  [continuation handoff](../../hyper_parallel/rl/docs/code_agent_handoff.md).
+- External-API repository inference is a separate acceptance entry, not a rollout engine or training runner.
+  Reuse the repository lifecycle and grader, keep the policy version absent, and return inference results instead of
+  `Trajectory`. Never invent sampled token IDs, logprobs, or policy publication evidence. Training entry points must
+  reject inference records; backend authentication stays controller-side. See the
+  [inference contract](../../hyper_parallel/rl/examples/code_agent/README.md#外部-api-仅推理验收).
 - Shared HyperParallel modules retain their own rules. For Qwen3 integration, also follow applicable model and
   distributed rules; do not apply RL policy to unrelated code or change shared contracts without examining other callers.
 

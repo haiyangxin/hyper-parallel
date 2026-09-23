@@ -16,9 +16,12 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import http.client
 import json
 import logging
+import secrets
 import threading
 import time
 import urllib.error
@@ -41,6 +44,15 @@ class _CallBudgetExceeded(ValueError):
     """Identify exhaustion of the gateway's explicit model-call budget."""
 
 
+class CompletionBudgetExhausted(ValueError):
+    """Identify a completed repository call budget without marking model failure."""
+
+    def __init__(self, termination: dict[str, Any]) -> None:
+        """Retain the verified terminal call count for the candidate relay."""
+        self.termination = dict(termination)
+        super().__init__(f"DeepSeek repository reached max_completions={termination['limit']}")
+
+
 class _ToolResponseFailure(RuntimeError):
     """Preserve the original attribution while terminating one DeepSeek model call."""
 
@@ -48,6 +60,44 @@ class _ToolResponseFailure(RuntimeError):
         """Retain evidence-based failure fields for the session trace."""
         super().__init__(outcome["failure_reason"])
         self.outcome = outcome
+
+
+def _repository_tool_argument_failure(response: dict[str, Any], request: dict[str, Any]) -> dict | None:
+    """Reject sampled arguments the SDK cannot execute under the declared schema."""
+    declared = {tool["function"]["name"]: tool["function"]["parameters"] for tool in request.get("tools", [])}
+    calls = response["choices"][0]["message"].get("tool_calls") or []
+    for call in calls:
+        function = call["function"]
+        name = function["name"]
+        if name not in declared:
+            return {"failure_origin": "model", "failure_reason": "undeclared_tool_name", "trainable": True,
+                    "tool_name": name}
+        try:
+            arguments = json.loads(function["arguments"])
+        except (TypeError, ValueError):
+            return {"failure_origin": "model", "failure_reason": "invalid_tool_arguments", "trainable": True,
+                    "tool_name": name}
+        if not isinstance(arguments, dict):
+            return {"failure_origin": "model", "failure_reason": "invalid_tool_arguments", "trainable": True,
+                    "tool_name": name}
+        parameters = declared[name]
+        properties = parameters.get("properties", {})
+        required = parameters.get("required") or []
+        extra = sorted(set(arguments) - set(properties))
+        missing = sorted(set(required) - set(arguments))
+        if extra or missing:
+            return {"failure_origin": "model", "failure_reason": "invalid_tool_schema", "trainable": True,
+                    "tool_name": name, "extra_arguments": extra, "missing_arguments": missing}
+        for key, value in arguments.items():
+            expected = properties[key].get("type")
+            valid = ((expected == "string" and isinstance(value, str))
+                     or (expected == "boolean" and isinstance(value, bool))
+                     or (expected == "integer" and isinstance(value, int) and not isinstance(value, bool))
+                     or (expected == "number" and isinstance(value, (int, float)) and not isinstance(value, bool)))
+            if not valid:
+                return {"failure_origin": "model", "failure_reason": "invalid_tool_schema", "trainable": True,
+                        "tool_name": name, "invalid_argument": key}
+    return None
 
 
 class DeepSeekChatProtocol:
@@ -140,8 +190,10 @@ class _Session:
     artifact_dir: Path | None
     max_completions: int
     generation: dict[str, Any]
+    repository_task: bool = False
     completions: list[dict[str, Any]] = field(default_factory=list)
     failure: dict[str, Any] | None = None
+    termination: dict[str, Any] | None = None
     closing: bool = False
     request_lock: Any = field(default_factory=threading.RLock)
 
@@ -158,6 +210,7 @@ class _State:
         self.protocol = DeepSeekChatProtocol()
         self.lock = threading.RLock()
         self.sessions: dict[str, _Session] = {}
+        self.released_sessions: set[str] = set()
 
     def register(self, session_id: str, payload: dict[str, Any]) -> None:
         """Validate and register a new gateway session and its artifact directory."""
@@ -192,13 +245,19 @@ class _State:
             raise ValueError(
                 "DeepSeek reasoning_effort must be 'off', 'high', or 'max'"
             )
+        repository_task = payload.get("repository_task", False)
+        if not isinstance(repository_task, bool):
+            raise ValueError("DeepSeek repository_task must be a boolean")
         session = _Session(
             policy_version=int(payload["policy_version"]),
             artifact_dir=artifact_dir,
             max_completions=max_completions,
             generation=dict(generation),
+            repository_task=repository_task,
         )
         with self.lock:
+            if session_id in self.released_sessions:
+                raise ValueError("Session was already released")
             if session_id in self.sessions:
                 raise ValueError(f"DeepSeek session already exists: {session_id}")
             self.sessions[session_id] = session
@@ -214,7 +273,11 @@ class _State:
 
     def remove(self, session_id: str) -> None:
         """Wait for this session's current request before releasing its trace."""
-        session = self.get(session_id)
+        with self.lock:
+            self.released_sessions.add(session_id)
+            session = self.sessions.get(session_id)
+        if session is None:
+            return
         with session.request_lock:
             session.closing = True
             self.event(session_id, "session.released", {})
@@ -226,8 +289,11 @@ class _State:
         session = self.get(session_id)
         with session.request_lock:
             session.closing = True
-            return {"policy_version": session.policy_version, "completions": list(session.completions),
-                    "failure": session.failure}
+            snapshot = {"policy_version": session.policy_version, "completions": list(session.completions),
+                        "failure": session.failure}
+            if session.repository_task:
+                snapshot["termination"] = session.termination
+            return snapshot
 
     def record_failure(self, session: _Session, outcome: dict[str, Any]) -> None:
         """Preserve untrainable failures regardless of subsequent model-budget errors."""
@@ -271,9 +337,16 @@ class _Handler(BaseHTTPRequestHandler):
     """Translate HTTP gateway requests into versioned backend completions."""
     server: _GatewayServer
 
+    def setup(self) -> None:
+        """Bound client I/O so stalled request bodies cannot hold session locks forever."""
+        super().setup()
+        self.connection.settimeout(self.server.state.request_timeout)
+
     def do_GET(self) -> None:  # pylint: disable=C0103
         """Serve health and captured-session inspection."""
         path = urlparse(self.path).path
+        if path.startswith("/internal/") and not self._authorize_admin():
+            return
         if path == "/healthz":
             self._json(HTTPStatus.OK, {"status": "ok"})
             return
@@ -285,19 +358,38 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError as error:
                 self._error(HTTPStatus.NOT_FOUND, str(error))
                 return
-            self._json(HTTPStatus.OK, snapshot)
+            try:
+                self._json(HTTPStatus.OK, snapshot)
+            except ValueError as error:
+                self._error(HTTPStatus.BAD_GATEWAY, str(error))
             return
         self._error(HTTPStatus.NOT_FOUND, "Unknown DeepSeek gateway route")
 
     def do_POST(self) -> None:  # pylint: disable=C0103
         """Register a session or proxy one DeepSeek chat request."""
-        try:
-            body = self._request_json()
-        except ValueError as error:
-            self._error(HTTPStatus.BAD_REQUEST, str(error))
-            return
         path = urlparse(self.path).path
+        if path.startswith("/internal/") and not self._authorize_admin():
+            return
+        if path.startswith("/internal/sessions/") and path.endswith("/failure"):
+            try:
+                self._request_json()
+                session_id = unquote(path[len("/internal/sessions/"):-len("/failure")])
+                session = self.server.state.get(session_id)
+                self.server.state.record_failure(session, {
+                    "failure_origin": "infrastructure", "trainable": False,
+                    "failure_reason": "Candidate relay transport failed",
+                })
+            except (ValueError, OSError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+                return
+            self._json(HTTPStatus.OK, {"recorded": True})
+            return
         if path == "/internal/sessions":
+            try:
+                body = self._request_json()
+            except (ValueError, OSError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+                return
             session_id = body.pop("session_id", None)
             try:
                 self.server.state.register(str(session_id or ""), body)
@@ -310,7 +402,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.NOT_FOUND, "Unknown DeepSeek gateway route")
             return
         try:
-            self._proxy_chat(body)
+            self._proxy_chat()
         except (RuntimeError, ValueError, OSError) as error:
             logger.exception("DeepSeek gateway request failed")
             self._error(HTTPStatus.BAD_GATEWAY, str(error))
@@ -318,6 +410,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # pylint: disable=C0103
         """Release one captured session while retaining its artifacts."""
         path = urlparse(self.path).path
+        if path.startswith("/internal/") and not self._authorize_admin():
+            return
         prefix = "/internal/sessions/"
         if not path.startswith(prefix):
             self._error(HTTPStatus.NOT_FOUND, "Unknown DeepSeek gateway route")
@@ -330,7 +424,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, {"released": session_id})
 
-    def _proxy_chat(self, original: dict[str, Any]) -> None:
+    def _proxy_chat(self, original: dict[str, Any] | None = None) -> None:
         """Forward a versioned chat request and capture its completion."""
         session_id = self.headers.get("x-deepseek-harness-session-id", "")
         if not session_id:
@@ -340,12 +434,28 @@ class _Handler(BaseHTTPRequestHandler):
             if session.closing:
                 raise ValueError(f"DeepSeek session is sealed: {session_id}")
             try:
+                if original is None:
+                    original = self._request_json()
                 self._complete_chat(session_id, session, original)
             except _CallBudgetExceeded:
                 self.server.state.record_failure(session, {
                     "failure_origin": "model", "failure_reason": "call_budget_exhausted", "trainable": True,
                 })
                 raise
+            except CompletionBudgetExhausted as error:
+                try:
+                    payload = {
+                        "error": {"type": "completion_budget_exhausted", "message": str(error)},
+                        "termination": error.termination,
+                    }
+                    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > self.server.max_response_bytes:
+                        raise ValueError("DeepSeek budget response exceeds max_response_bytes")
+                    self._json(HTTPStatus.CONFLICT, payload)
+                except (RuntimeError, ValueError, OSError) as delivery_error:
+                    self.server.state.record_failure(session, {
+                        "failure_origin": "infrastructure", "failure_reason": str(delivery_error), "trainable": False,
+                    })
+                    raise
             except _ToolResponseFailure as error:
                 self.server.state.record_failure(session, error.outcome)
                 raise
@@ -357,12 +467,21 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _complete_chat(self, session_id: str, session: _Session, original: dict[str, Any]) -> None:
         """Keep budget checking, backend execution and evidence capture atomic per session."""
+        if session.failure is not None:
+            raise RuntimeError("DeepSeek session has an unresolved request failure")
+        if session.termination is not None:
+            raise CompletionBudgetExhausted(session.termination)
         if len(session.completions) >= session.max_completions:
+            if session.repository_task:
+                session.termination = {
+                    "reason": "max_completions", "limit": session.max_completions,
+                    "completed": len(session.completions), "policy_version": session.policy_version,
+                }
+                self.server.state.event(session_id, "session.budget_exhausted", session.termination)
+                raise CompletionBudgetExhausted(session.termination)
             raise _CallBudgetExceeded(
                 f"DeepSeek session exceeded max_completions={session.max_completions}"
             )
-        if session.failure is not None:
-            raise RuntimeError("DeepSeek session has an unresolved request failure")
         protocol_request = dict(original)
         reasoning_effort = session.generation.get("reasoning_effort")
         if reasoning_effort is not None:
@@ -370,6 +489,15 @@ class _Handler(BaseHTTPRequestHandler):
         transformed = self.server.state.protocol.transform_request(
             protocol_request, self.server.state.model_name
         )
+        if session.repository_task:
+            # transform_request makes a shallow copy; never rewrite the SDK's raw request.
+            transformed["tools"] = copy.deepcopy(transformed.get("tools", []))
+            for tool in transformed.get("tools", []):
+                function = tool.get("function", {})
+                parameters = function.get("parameters", {})
+                if not isinstance(parameters.get("properties"), dict):
+                    raise ValueError("Repository DeepSeek tool schema lacks argument properties")
+                function["parameters"] = {**parameters, "additionalProperties": False}
         transformed.update(
             {
                 name: value
@@ -377,8 +505,17 @@ class _Handler(BaseHTTPRequestHandler):
                 if name != "reasoning_effort"
             }
         )
-        response = self._backend_request(transformed)
+        try:
+            response = self._backend_request(transformed)
+        except (RuntimeError, ValueError, OSError) as error:
+            self.server.state.event(session_id, "completion.backend_rejected",
+                                    self._rejected_request_evidence(original, transformed, error))
+            raise
         outcome = inspect_tool_response(response)
+        if session.repository_task and outcome["failure_origin"] is None:
+            tool_failure = _repository_tool_argument_failure(response, transformed)
+            if tool_failure is not None:
+                outcome = tool_failure
         self.server.state.save_completion(
             session_id,
             {
@@ -403,22 +540,43 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, response)
 
+    @staticmethod
+    def _rejected_request_evidence(original: dict[str, Any], transformed: dict[str, Any],
+                                   error: Exception) -> dict[str, Any]:
+        """Keep the rejected model context when bounded, and hashes otherwise."""
+        evidence: dict[str, Any] = {"error_type": type(error).__name__}
+        for name, request in (("original", original), ("model", transformed)):
+            encoded = json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            evidence[f"{name}_bytes"] = len(encoded)
+            evidence[f"{name}_sha256"] = hashlib.sha256(encoded).hexdigest()
+            if len(encoded) <= 256 * 1024:
+                evidence[f"{name}_request"] = request
+        return evidence
+
     def _write_sse(self, response: dict[str, Any]) -> None:
-        try:
-            for event in self.server.state.protocol.stream_events(response):
-                payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
-                self.wfile.write(b"data: " + payload + b"\n\n")
-                self.wfile.flush()
-            self.wfile.write(b"data: [DONE]\n\n")
+        deadline = time.monotonic() + self.server.state.request_timeout
+        total = len(b"data: [DONE]\n\n")
+        for event in self.server.state.protocol.stream_events(response):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Gateway SSE write exceeded request_timeout")
+            payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
+            frame = b"data: " + payload + b"\n\n"
+            total += len(frame)
+            if total > self.server.max_response_bytes:
+                raise ValueError("Gateway SSE response exceeds max_response_bytes")
+            self.wfile.write(frame)
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            logger.debug("DeepSeek Harness disconnected before SSE completion")
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
     def _backend_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Send a JSON chat request to the configured inference backend."""
+        data = json.dumps(payload).encode("utf-8")
+        if len(data) > self.server.max_request_bytes:
+            raise ValueError("Backend request exceeds max_request_bytes")
         request = urllib.request.Request(
             f"{self.server.state.backend_url}/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
+            data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -426,9 +584,9 @@ class _Handler(BaseHTTPRequestHandler):
             with urllib.request.urlopen(
                 request, timeout=self.server.state.request_timeout
             ) as response:
-                body = response.read()
+                body = self._read_backend(response)
         except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
+            detail = self._read_backend(error).decode("utf-8", errors="replace")
             raise RuntimeError(
                 f"vLLM chat completion failed with HTTP {error.code}: {detail}"
             ) from error
@@ -448,6 +606,40 @@ class _Handler(BaseHTTPRequestHandler):
             raise RuntimeError("vLLM chat completion returned a non-object response")
         return decoded
 
+    def _authorize_admin(self) -> bool:
+        """Authenticate management requests before reading bodies or touching session state."""
+        supplied = self.headers.get("Authorization", "")
+        if secrets.compare_digest(supplied.encode(), ("Bearer " + self.server.admin_token).encode()):
+            return True
+        self._error(HTTPStatus.UNAUTHORIZED, "Management authentication required")
+        return False
+
+    def _read_body(self, stream: Any, limit: int, length: int | None = None) -> bytes:
+        """Bound total read time as well as bytes, including clients that continually drip data."""
+        deadline = time.monotonic() + self.server.state.request_timeout
+        chunks = []
+        total = 0
+        while length is None or total < length:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Gateway body read exceeded request_timeout")
+            size = min(65536, limit + 1 - total, length - total if length is not None else limit + 1)
+            chunk = stream.read1(size)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Gateway body read exceeded request_timeout")
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ValueError("Gateway body exceeds max_response_bytes")
+            chunks.append(chunk)
+        if length is not None and total != length:
+            raise ValueError("Request body ended before Content-Length")
+        return b"".join(chunks)
+
+    def _read_backend(self, response: Any) -> bytes:
+        """Bound successful and error backend bodies without silently truncating evidence."""
+        return self._read_body(response, self.server.max_response_bytes)
+
     def _request_json(self) -> dict[str, Any]:
         """Read and validate the HTTP request body as a JSON object."""
         try:
@@ -456,8 +648,13 @@ class _Handler(BaseHTTPRequestHandler):
             raise ValueError("Invalid Content-Length") from error
         if length <= 0:
             raise ValueError("Request body must be non-empty")
+        if length > self.server.max_request_bytes:
+            raise ValueError("Gateway request exceeds max_request_bytes")
+        if self.headers.get("Transfer-Encoding"):
+            raise ValueError("Transfer-Encoding is unsupported")
+        encoded = self._read_body(self.rfile, self.server.max_request_bytes, length)
         try:
-            body = json.loads(self.rfile.read(length))
+            body = json.loads(encoded)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("Request body must be valid JSON") from error
         if not isinstance(body, dict):
@@ -473,6 +670,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if len(body) > self.server.max_response_bytes:
+            if status < HTTPStatus.BAD_REQUEST:
+                raise ValueError("Gateway response exceeds max_response_bytes")
+            body = b""
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -480,7 +681,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _error(self, status: HTTPStatus, message: str) -> None:
-        self._json(status, {"error": {"message": message, "type": "gateway_error"}})
+        self._json(status, {"error": {"message": message.replace(self.server.admin_token, "[redacted]")[:2048],
+                                      "type": "gateway_error"}})
 
     # BaseHTTPRequestHandler's first argument is positional; avoid shadowing the format builtin.
     def log_message(self, format_string: str, *args: Any) -> None:  # pylint: disable=arguments-differ
@@ -492,9 +694,18 @@ class _GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], state: _State) -> None:
+    def __init__(self, address: tuple[str, int], state: _State, admin_token: str | None,
+                 max_request_bytes: int, max_response_bytes: int) -> None:
         """Bind the request handler to this gateway's protocol and sessions."""
         self.state = state
+        if admin_token is not None and (not isinstance(admin_token, str) or not admin_token.strip()):
+            raise ValueError("Gateway admin_token must be a non-empty string")
+        for name, value in (("max_request_bytes", max_request_bytes), ("max_response_bytes", max_response_bytes)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"Gateway {name} must be a positive integer")
+        self.admin_token = admin_token or secrets.token_urlsafe(32)
+        self.max_request_bytes = max_request_bytes
+        self.max_response_bytes = max_response_bytes
         super().__init__(address, _Handler)
 
 
@@ -508,6 +719,9 @@ class DeepSeekGateway:
         backend_url: str,
         model_name: str,
         request_timeout: float,
+        admin_token: str | None = None,
+        max_request_bytes: int = 8 * 1024 * 1024,
+        max_response_bytes: int = 32 * 1024 * 1024,
     ) -> None:
         """Initialize an unstarted DeepSeek gateway."""
         if not host:
@@ -515,9 +729,15 @@ class DeepSeekGateway:
         if not 0 <= port < 65536:
             raise ValueError("DeepSeek gateway port must be in [0, 65535]")
         self._server = _GatewayServer(
-            (host, port), _State(backend_url, model_name, request_timeout)
+            (host, port), _State(backend_url, model_name, request_timeout),
+            admin_token, max_request_bytes, max_response_bytes,
         )
         self._thread: threading.Thread | None = None
+
+    @property
+    def admin_token(self) -> str:
+        """Return the controller-only management credential; never pass it to candidates."""
+        return self._server.admin_token
 
     @property
     def address(self) -> tuple[str, int]:

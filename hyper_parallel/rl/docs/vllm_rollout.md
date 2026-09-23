@@ -177,3 +177,9 @@ matched TP consistency mismatch/max/mean = 0/0/0
 ```
 
 Bit-exact 定义见 [Qwen3 训练-推理一致性](qwen3_training_inference_consistency.md)。
+
+## 仓库级 Code Agent 的模型访问
+
+受信控制端为每个候选创建固定 session 的 relay。候选通过容器内的本地入口访问共享 vLLM，
+不持有管理凭证，也不创建独立模型服务；采样的真实调用继续按本文件的策略版本和发布合同校验。
+部署及失败边界见 [仓库示例](../examples/code_agent/README.md)。

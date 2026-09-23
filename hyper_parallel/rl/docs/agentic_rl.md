@@ -36,6 +36,16 @@ rollout manager。Agentic 不绕过 Trainer，也不直接更新模型参数。
 DeepSeek 的实现目录是 `rl/agentic/ds_harness/`，YAML 中的 runner 值和子配置键仍分别是 `deepseek` 与
 `agentic.deepseek`。
 
+仓库外部 API 的仅推理验收由 `examples/code_agent/inference.py` 单独编排，不是第四个训练 runner。
+它复用 Codex 仓库执行、冻结产物和独立评分，返回显式推理结果，策略版本为空。
+结构化工具响应与 usage 不等于逐 token 训练证据；该入口不创建 `Trajectory` 或 `ExperienceBatch`，
+训练构造器拒绝推理记录。接口与操作见[仓库推理合同](../examples/code_agent/README.md#外部-api-仅推理验收)。
+
+仓库外部 API 的仅推理验收由 `examples/code_agent/inference.py` 单独编排，不是第四个训练 runner。
+它复用 Codex 仓库执行、冻结产物和独立评分，返回显式推理结果，策略版本为空。
+结构化工具响应与 usage 不等于逐 token 训练证据；该入口不创建 `Trajectory` 或 `ExperienceBatch`，
+训练构造器拒绝推理记录。接口与操作见[仓库推理合同](../examples/code_agent/README.md#外部-api-仅推理验收)。
+
 ### Internal：框架内多轮交互
 
 `AgentRunner` 为每个 `PromptRecord` 创建 `AgentSession` 和已注册的 Environment。每一轮按以下顺序运行：
@@ -142,6 +152,8 @@ DP rank 的调用行数不同会追加 `dp_padding` 行，保留合法上下文�
 Codex 格式重采样也计入调用额度和完整 episode；已确认的模型格式错误耗尽额度时形成零奖励终止结果。
 DeepSeek 保留自己的终止方式：已记录证据的模型格式错误或明确调用额度耗尽可形成零奖励终止，
 未知 SDK `error/aborted`、服务错误和解析证据不一致均拒绝训练。
+仓库任务的 DeepSeek 调用额度是例外：Gateway 发结构化 409 后，只有 SDK 终态与已记录次数精确吻合
+才停止并冻结现有源码，由独立 grader 决定奖励；其他 SDK 异常仍拒绝训练。
 外部程序结束、超时或取消后清理本程序组的工具子进程；vLLM 先优雅退出，超时才强制终止。
 最终 checkpoint 在评估结束后先释放 vLLM 及其 IPC 消费者，减少保存阶段的资源竞争。
 
@@ -222,3 +234,11 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 `hyper_parallel/rl/tests/st/test_feature_st.py` 提供独立两进程 Gloo 梯度验证及真实 agent 训练入口。
 Gloo 验证不需要模型；真实训练须显式配置 CLI/SDK、模型、数据、设备与具有不等调用的任务，
 并保留真实参数更新、策略版本和零损失补齐断言。CPU 用例及资源缺失时的 skip 不能代替真机验收。
+
+## 仓库级 Code Agent 的扩展边界
+
+`examples/code_agent/` 将候选编辑放在隔离 Docker 工作区，由独立 grader 对冻结产物判题。
+模型访问经固定 session 的 relay 返回共享 vLLM；训练仍使用本节定义的逐调用轨迹和 episode GRPO。
+候选容器不持有管理凭证、Docker socket、权重或 NPU，服务与传输失败仍拒绝训练。
+小规模功能验收与未解决的空补丁问题见 [开发记录](code_agent_development.md) 和
+[交接](code_agent_handoff.md)。

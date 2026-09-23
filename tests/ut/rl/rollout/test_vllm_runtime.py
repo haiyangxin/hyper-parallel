@@ -189,6 +189,11 @@ def test_shared_vllm_endpoint_has_one_owner_and_normal_lifecycle(
     )
     monkeypatch.setattr(
         vllm_module._VLLMHTTPClient,
+        "start_process_monitor",
+        lambda client: events.append(("monitor", client.base_url)),
+    )
+    monkeypatch.setattr(
+        vllm_module._VLLMHTTPClient,
         "wait_ready",
         lambda client, timeout: events.append(
             ("ready", client.base_url, timeout)
@@ -217,6 +222,9 @@ def test_shared_vllm_endpoint_has_one_owner_and_normal_lifecycle(
     assert not peer_client.is_server_owner
     assert peer_client.base_url == owner_client.base_url
     assert len([event for event in events if isinstance(event, tuple) and event[0] == "launch"]) == 1
+    assert [event for event in events if isinstance(event, tuple) and event[0] == "monitor"] == [
+        ("monitor", owner_client.base_url),
+    ]
     assert events[-2:] == ["server-close", "transfer-close"]
 
 

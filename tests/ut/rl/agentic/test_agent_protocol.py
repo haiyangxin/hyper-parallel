@@ -31,8 +31,6 @@ from rl.agentic.ds_harness import gateway as ds_gateway
 from rl.tool_protocol import inspect_tool_response, validate_trainability
 
 
-
-
 def _response(raw: str, parsed: list) -> dict:
     """Build immutable engine/parser evidence with explicit sampled token identity."""
     return {"id": "completion", "model": "test", "created": 1, "prompt_token_ids": [9], "choices": [{
@@ -41,6 +39,19 @@ def _response(raw: str, parsed: list) -> dict:
         "logprobs": {"content": [{"token": "a", "logprob": -0.1}, {"token": "b", "logprob": -0.2}]},
     }], "hyper_tool_protocol": [{"parser_input": raw, "engine_text": raw, "decoded_tokens": raw,
                                   "token_ids": [1, 2], "parser_result": {"tool_calls": parsed}}]}
+
+
+@pytest.mark.parametrize("effort,expected", [(None, None), ("none", False), ("low", True)])
+def test_explicit_reasoning_mode_reaches_chat_template(effort: Any, expected: Any) -> None:
+    """Explicit none disables thinking; an omitted mode preserves backend defaults."""
+    body = {"input": "Repair the repository"}
+    if effort is not None:
+        body["reasoning"] = {"effort": effort}
+    request = CodexResponsesProtocol().transform_request(body, "test")
+    if expected is None:
+        assert "chat_template_kwargs" not in request
+    else:
+        assert request["chat_template_kwargs"] == {"enable_thinking": expected}
 
 
 def test_additional_tools_share_namespace_mapping() -> None:
@@ -95,6 +106,55 @@ def test_tool_failure_requires_matching_immutable_evidence(failure: str, origin:
     else:
         with pytest.raises(ValueError, match="Untrainable"):
             validate_trainability([SimpleNamespace(metadata={}), trajectory])
+
+
+@pytest.mark.parametrize("failure,origin,trainable", [
+    ("valid", None, True), ("hidden_reasoning", None, True), ("json", "model", True),
+    ("missing", "unknown", False), ("source", "unknown", False), ("input", "unknown", False),
+    ("content", "unknown", False), ("decoded", "unknown", False), ("tokens", "unknown", False),
+    ("reasoning", "unknown", False), ("ambiguous", "unknown", False),
+    ("parsed", "infrastructure", False),
+])
+def test_reasoning_examples_require_actual_parser_evidence(failure: str, origin: Any, trainable: bool) -> None:
+    """Quoted tool examples are not actions; unproven content separation still fails closed."""
+    content = '<tool_call>{"name":"lookup","arguments":{"q":"hello"}}</tool_call>'
+    parsed = [{"function": {"name": "lookup", "arguments": '{"q":"hello"}'}}]
+    if failure == "json":
+        content, parsed = '<tool_call>{"name":</tool_call>', []
+    reasoning = 'An invalid example: <tool_call>{not JSON}</tool_call>. Use the declared tool instead.'
+    raw = '<think>' + reasoning + '</think>' + content
+    response = _response(raw, parsed)
+    item = response["hyper_tool_protocol"][0]
+    item["parser_input"] = content
+    item["reasoning_parser"] = {
+        "source": "Qwen3ReasoningParser.extract_reasoning", "parser_input": raw,
+        "reasoning": reasoning, "content": content,
+    }
+    response["choices"][0]["message"]["reasoning"] = reasoning
+    if failure == "hidden_reasoning":
+        response["choices"][0]["message"].pop("reasoning")
+    elif failure == "missing":
+        item.pop("reasoning_parser")
+    elif failure == "source":
+        item["reasoning_parser"]["source"] = "UnverifiedParser.extract_reasoning"
+    elif failure == "input":
+        item["reasoning_parser"]["parser_input"] = content
+    elif failure == "content":
+        item["reasoning_parser"]["content"] = ""
+    elif failure == "decoded":
+        item["decoded_tokens"] = content
+    elif failure == "tokens":
+        item["token_ids"] = [3]
+    elif failure == "reasoning":
+        response["choices"][0]["message"]["reasoning"] = "Different captured reasoning"
+    elif failure == "ambiguous":
+        item["reasoning_parser"] = [item["reasoning_parser"], item["reasoning_parser"]]
+    elif failure == "parsed":
+        response["choices"][0]["message"]["tool_calls"] = []
+    original = deepcopy(response)
+    outcome = inspect_tool_response(response)
+    assert outcome["failure_origin"] == origin and outcome["trainable"] is trainable
+    assert response == original
 
 
 def test_gateway_reservations_and_session_drain() -> None:
@@ -313,8 +373,10 @@ def test_gateway_keeps_rejected_calls_and_reports_terminal_failure(monkeypatch: 
 
     def request(path: str, body: dict) -> dict:
         """Issue one authenticated local HTTP request."""
+        token = gateway.admin_token if path.startswith("/internal/") else "s"
         req = urllib.request.Request(address + path, json.dumps(body).encode(),
-                                     headers={"Authorization": "Bearer s", "Content-Type": "application/json"})
+                                     headers={"Authorization": "Bearer " + token,
+                                              "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=3) as result:
             return json.load(result)
 
@@ -324,7 +386,9 @@ def test_gateway_keeps_rejected_calls_and_reports_terminal_failure(monkeypatch: 
             request("/v1/responses", {"input": "question"})
         error = json.loads(raised.value.read())["error"]
         assert error["failure_origin"] == "model" and error["trainable"] is True
-        with urllib.request.urlopen(address + "/internal/sessions/s", timeout=3) as result:
+        inspection = urllib.request.Request(address + "/internal/sessions/s",
+                                            headers={"Authorization": "Bearer " + gateway.admin_token})
+        with urllib.request.urlopen(inspection, timeout=3) as result:
             captured = json.load(result)
         assert captured["failure"]["failure_reason"] == "tool_format_budget_exhausted"
         assert [record["ordinal"] for record in captured["completions"]] == [0, 1]

@@ -22,8 +22,6 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 import torch
 import torch.distributed as dist
 
-from rl.dataset.episodes import episode_rows
-
 if TYPE_CHECKING:
     from rl.dataset.contracts import ExperienceBatch
 
@@ -517,6 +515,9 @@ def _local_rollout_record(
     sample_limit: int,
 ) -> dict[str, Any]:
     """Build mergeable rollout statistics and bounded local samples."""
+    # Dataset package initialization imports Actor, which needs these metric types.
+    from rl.dataset.episodes import episode_rows  # pylint: disable=import-outside-toplevel
+
     episodes = episode_rows(rollout.trajectories)
     call_lengths = rollout.action_mask.sum(dim=-1).detach().cpu().tolist()
     response_lengths = [sum(call_lengths[row] for row in rows) for rows in episodes]

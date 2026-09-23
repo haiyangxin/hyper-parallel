@@ -72,6 +72,11 @@ Actor 更新 → PPO Critic 更新 → 发布 Actor 策略 → 提交 policy_ver
 - `RLCheckpointManager` 保存角色、优化器、调度器、数据加载器、步数及 RNG 状态。恢复后训练器按恢复步数
   重新发布策略。评估输出使用 `validation/` 指标，和训练 rollout 的 `reward/` 指标分开。
 
+仓库外部 API 的功能验收另由 `hyper_parallel/rl/examples/code_agent/inference.py` 编排。
+它复用 Codex Gateway、候选工作区、产物冻结和独立 grader，返回显式不可训练的推理结果，
+不经过上述 `ExperienceBatch`、Actor 更新或策略发布流程。它不新增训练 runner 或 rollout engine；
+模式隔离、凭证和运行边界见[仅推理合同](../hyper_parallel/rl/examples/code_agent/README.md#外部-api-仅推理验收)。
+
 ## 4. Torch 与平台边界
 
 RL 和 `hyper_parallel/models/qwen3/` 直接使用 Torch 与 Torch distributed API，不通过 Platform 或

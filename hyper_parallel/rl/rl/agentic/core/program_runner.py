@@ -21,6 +21,7 @@ import hashlib
 import importlib
 import json
 import math
+import secrets
 import time
 import urllib.error
 import urllib.request
@@ -69,6 +70,8 @@ def _sampled_logprobs(content, response_ids, label) -> list[float]:
 
 def _trace(record: Mapping[str, Any], label: str) -> dict[str, Any]:
     """Validate a captured completion and extract its normalized token trace."""
+    if record.get("metadata", {}).get("inference_only") is True:
+        raise ValueError(f"{label} cannot train on inference-only completions")
     request = record.get("request")
     response = record.get("response")
     if not isinstance(request, Mapping) or not isinstance(response, Mapping):
@@ -347,20 +350,26 @@ def request_gateway_json(
     url: str,
     payload: Mapping[str, Any] | None,
     timeout: float,
+    admin_token: str | None = None,
+    max_response_bytes: int = 32 * 1024 * 1024,
 ) -> dict[str, Any]:
     """Exchange one JSON object with an external harness gateway."""
     data = None if payload is None else json.dumps(dict(payload)).encode("utf-8")
-    request = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method=method
-    )
+    headers = {"Content-Type": "application/json"}
+    if admin_token:
+        headers["Authorization"] = f"Bearer {admin_token}"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            content = response.read()
+        with opener.open(request, timeout=timeout) as response:
+            content = response.read(max_response_bytes + 1)
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
+        detail = error.read(4096).decode("utf-8", errors="replace")
         raise RuntimeError(f"{label} gateway HTTP {error.code}: {detail}") from error
     except urllib.error.URLError as error:
         raise RuntimeError(f"{label} gateway request failed: {error.reason}") from error
+    if len(content) > max_response_bytes:
+        raise RuntimeError(f"{label} gateway response exceeded its byte limit")
     try:
         decoded = json.loads(content)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -427,11 +436,13 @@ class HarnessRuntime:
         self._gateway_options = dict(gateway_options or {})
         self._gateway: Any | None = None
         self._episode_version: int | None = None
+        self.admin_token: str | None = None
         host = str(self.config.get("gateway_host", "127.0.0.1"))
         public_host = str(self.config.get("gateway_public_host", host))
         port = int(self.config.get("gateway_port", default_port))
-        self.admin_url = f"http://{public_host}:{port}"
-        self.gateway_url = f"{self.admin_url}{api_prefix}"
+        admin_host = str(self.config.get("gateway_admin_host", public_host))
+        self.admin_url = f"http://{admin_host}:{port}"
+        self.gateway_url = f"http://{public_host}:{port}{api_prefix}"
 
     def ensure_started(self) -> None:
         """Materialize vLLM and start the protocol gateway on rank zero."""
@@ -442,18 +453,25 @@ class HarnessRuntime:
         local_error = None
         if dist.get_rank() == 0 and self._gateway is None:
             try:
+                self.admin_token = secrets.token_urlsafe(32)
                 self._gateway = self._gateway_factory(
                     host=str(self.config.get("gateway_host", "127.0.0.1")),
                     port=int(self.config.get("gateway_port", self._default_port)),
                     backend_url=backend_url,
                     model_name=model_name,
                     request_timeout=float(self.config.get("request_timeout", 600.0)),
+                    admin_token=self.admin_token,
+                    max_request_bytes=int(self.config.get("max_request_bytes", 8 * 1024 * 1024)),
+                    max_response_bytes=int(self.config.get("max_response_bytes", 32 * 1024 * 1024)),
                     **self._gateway_options,
                 )
                 self._gateway.start()
             except Exception as error:  # pylint: disable=W0718
                 local_error = error
         self.engine.synchronize_error(local_error, f"{self._label} gateway startup")
+        credential = [self.admin_token]
+        dist.broadcast_object_list(credential, src=0)
+        self.admin_token = credential[0]
         dist.barrier()
 
     def close(self) -> None:
@@ -511,6 +529,7 @@ class HarnessProgramFactory:
         urls = {"gateway_url": self.runtime.gateway_url}
         if self.include_admin_url:
             urls["admin_url"] = self.runtime.admin_url
+            urls["admin_token"] = self.runtime.admin_token
         return self.program_type(
             prompt=prompt,
             policy_version=policy_version,

@@ -1,0 +1,57 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+
+ARG CLI_IMAGE=sha256:12c0ec8f5b1a8024b415ecab27f26e9bb4d0d5434b175cd9ea8cfb5744d2c6da
+ARG TASK_IMAGE
+FROM ${CLI_IMAGE} AS cli_runtime
+
+# The bridge needs the standard library, not the training site-packages.
+RUN tar -C /usr/local --exclude=python3.12.13/lib/python3.12/site-packages \
+    --exclude=python3.12.13/include --exclude=python3.12.13/share \
+    -cf /tmp/hyper-python-runtime.tar python3.12.13
+
+FROM ${TASK_IMAGE}
+SHELL ["/bin/bash", "-c"]
+COPY --from=cli_runtime /opt/codex /opt/codex
+COPY --from=cli_runtime /tmp/hyper-python-runtime.tar /tmp/hyper-python-runtime.tar
+RUN tar -C /usr/local -xf /tmp/hyper-python-runtime.tar && rm /tmp/hyper-python-runtime.tar
+
+ENV PATH=/opt/codex/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/python3.12.13/bin:/usr/local/bin:/usr/bin:/bin \
+    LD_LIBRARY_PATH=/usr/local/python3.12.13/lib \
+    HOME=/opt/hyper-agent-home CODEX_HOME=/opt/hyper-codex-home \
+    PYTHONPATH="" PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Freeze the original project's build requirements for offline official reinstallation.
+RUN /usr/local/python3.12.13/bin/python -I -c \
+    'import pathlib,tomllib; d=tomllib.loads(pathlib.Path("/testbed/pyproject.toml").read_text()); print("\n".join(d["build-system"]["requires"] + ["wheel"]))' \
+    > /tmp/hyper-build-requires.txt \
+    && python -m pip download --only-binary=:all: -d /opt/hyper-wheels -r /tmp/hyper-build-requires.txt \
+    && sha256sum /opt/hyper-wheels/* > /opt/hyper-build-wheels.sha256 \
+    && rm /tmp/hyper-build-requires.txt
+ENV PIP_NO_INDEX=1 PIP_FIND_LINKS=/opt/hyper-wheels
+
+RUN printf '%s\n' \
+    'export PATH=/opt/codex/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/python3.12.13/bin:/usr/local/bin:/usr/bin:/bin' \
+    > /etc/profile \
+    && mkdir -p /workspace /opt/hyper-agent-home /opt/hyper-codex-home \
+    && chmod 700 /opt/hyper-agent-home /opt/hyper-codex-home \
+    && python -m pip install -e /testbed \
+    && test "$(codex --version)" = 'codex-cli 0.152.1' \
+    && /usr/local/python3.12.13/bin/python -I -c 'import asyncio,http.server,json,subprocess' \
+    && python -I -c 'import pytest; print(pytest.__version__)'
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["/bin/sleep", "infinity"]

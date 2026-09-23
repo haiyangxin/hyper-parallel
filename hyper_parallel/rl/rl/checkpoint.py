@@ -25,11 +25,11 @@ import torch
 import torch.distributed as dist
 import yaml
 
+from rl.utils.monitoring.config import sanitize_config
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.distributed_checkpoint import load as dcp_load
 from hyper_parallel.core.distributed_checkpoint import save as dcp_save
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
-from rl.utils.monitoring.config import sanitize_config
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +117,8 @@ class RLCheckpointManager:
                 )
             with manifest_path.open(encoding="utf-8") as handle:
                 manifest = json.load(handle)
+            if not isinstance(manifest, dict):
+                raise RuntimeError("Checkpoint completion manifest must be an object")
             world_size = dist.get_world_size()
             if int(manifest.get("world_size", -1)) != world_size:
                 raise RuntimeError(
@@ -130,6 +132,15 @@ class RLCheckpointManager:
                 raise RuntimeError(f"Checkpoint rank-local state is missing: {rank_state}")
             if not (checkpoint_dir / "extra_state.json").is_file():
                 raise RuntimeError(f"Checkpoint training progress is missing: {checkpoint_dir}")
+            with (checkpoint_dir / "extra_state.json").open(encoding="utf-8") as handle:
+                progress = json.load(handle)
+            if not isinstance(progress, dict):
+                raise RuntimeError("Checkpoint training progress must be an object")
+            step = progress.get("global_step")
+            manifest_step = manifest.get("step")
+            if (any(not isinstance(value, int) or isinstance(value, bool) for value in (step, manifest_step))
+                    or step < 0 or manifest_step != step):
+                raise RuntimeError("Checkpoint manifest step and training global_step must match nonnegative integers")
 
         self.run_synchronized("checkpoint resume preflight", validate_files)
 

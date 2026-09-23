@@ -137,3 +137,5 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
 在迁移阶段均曾通过；更新代码或运行环境后需重新验收，不能把历史结果当作当前入口的新运行结果。
 系统测试入口及边界见[功能与验证说明](../../docs/moe_code_agent.md#系统测试)。
 为快速检查链路而复用同一批题作为 train/validation 时，必须明确记录重叠，不报告为独立泛化评估。
+
+仓库级多轮读改测与独立判题见[Code Agent 示例](../code_agent/README.md)；本示例仍专注单轮 Python stdio 判题。

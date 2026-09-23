@@ -1,0 +1,158 @@
+{
+  "merge_intervals": {
+    "description": "Repair interval merging. Input is a JSON list of [start, end] integer intervals (start <= end). Return sorted disjoint intervals; touching intervals must merge. Handle empty input, unsorted input, nesting and duplicates. Only src/*.py may change; entrypoint.py and public_test.py are protected.",
+    "reference": {
+      "src/helpers.py": "# Copyright 2026 Huawei Technologies Co., Ltd\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n# ============================================================================\ndef ordered(intervals: list[list[int]]) -> list[list[int]]:\n    \"\"\"Order intervals before merging.\"\"\"\n    return sorted(intervals)\n",
+      "src/solution.py": "# Copyright 2026 Huawei Technologies Co., Ltd\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n# ============================================================================\nfrom src.helpers import ordered\n\n\ndef solve(intervals: list[list[int]]) -> list[list[int]]:\n    \"\"\"Return the merged intervals.\"\"\"\n    result = []\n    for start, end in ordered(intervals):\n        if result and start <= result[-1][1]:\n            result[-1][1] = max(result[-1][1], end)\n        else:\n            result.append([start, end])\n    return result\n"
+    },
+    "cases": [
+      [
+        [],
+        []
+      ],
+      [
+        [
+          [
+            3,
+            4
+          ],
+          [
+            1,
+            3
+          ]
+        ],
+        [
+          [
+            1,
+            4
+          ]
+        ]
+      ],
+      [
+        [
+          [
+            1,
+            9
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            9,
+            12
+          ]
+        ],
+        [
+          [
+            1,
+            12
+          ]
+        ]
+      ],
+      [
+        [
+          [
+            5,
+            5
+          ],
+          [
+            1,
+            2
+          ],
+          [
+            1,
+            2
+          ]
+        ],
+        [
+          [
+            1,
+            2
+          ],
+          [
+            5,
+            5
+          ]
+        ]
+      ],
+      [
+        [
+          [
+            -5,
+            -3
+          ],
+          [
+            -4,
+            0
+          ],
+          [
+            2,
+            3
+          ]
+        ],
+        [
+          [
+            -5,
+            0
+          ],
+          [
+            2,
+            3
+          ]
+        ]
+      ]
+    ]
+  },
+  "word_counts": {
+    "description": "Repair word counting. Input is a JSON list of strings. Count case-insensitive ASCII words matching [a-z]+ across all strings; punctuation, digits and whitespace separate words. Return a JSON object mapping each lowercase word to its count. Empty input returns {}. Only src/*.py may change, add new modules if useful; entrypoint.py and public_test.py are protected.",
+    "reference": {
+      "src/normalization.py": "# Copyright 2026 Huawei Technologies Co., Ltd\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n# ============================================================================\nimport re\n\n\ndef words(text: str) -> list[str]:\n    \"\"\"Return words extracted from one input string.\"\"\"\n    return re.findall(r\"[a-z]+\", text.lower())\n",
+      "src/helpers.py": "# Copyright 2026 Huawei Technologies Co., Ltd\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n# ============================================================================\nfrom src.normalization import words\n",
+      "src/legacy.py": null,
+      "src/solution.py": "# Copyright 2026 Huawei Technologies Co., Ltd\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n# ============================================================================\nfrom src.helpers import words\n\n\ndef solve(lines: list[str]) -> dict[str, int]:\n    \"\"\"Count words from all input lines.\"\"\"\n    result = {}\n    for line in lines:\n        for word in words(line):\n            result[word] = result.get(word, 0) + 1\n    return result\n"
+    },
+    "cases": [
+      [
+        [],
+        {}
+      ],
+      [
+        [
+          "Hello, hello!"
+        ],
+        {
+          "hello": 2
+        }
+      ],
+      [
+        [
+          "A1a",
+          "B_b B"
+        ],
+        {
+          "a": 2,
+          "b": 3
+        }
+      ],
+      [
+        [
+          "",
+          " ... 123 "
+        ],
+        {}
+      ],
+      [
+        [
+          "One two",
+          "TWO three ONE"
+        ],
+        {
+          "one": 2,
+          "two": 2,
+          "three": 1
+        }
+      ]
+    ]
+  }
+}

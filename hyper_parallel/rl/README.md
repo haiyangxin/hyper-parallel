@@ -314,6 +314,8 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
 | --- | --- |
 | [运行镜像](docker/README.md) | 镜像下载、校验、固定依赖和宿主要求 |
 | [Agentic RL](docs/agentic_rl.md) | 内部环境、Codex / DeepSeek Harness 的配置、轨迹与接入边界 |
+| [仓库级 Code Agent](examples/code_agent/README.md) | 隔离仓库任务、独立评分、模型中继、训练与 SWE-bench 小规模功能流程 |
+| [Code Agent 交接](docs/code_agent_handoff.md) | 当前开发分支的状态、证据边界与后续排查顺序 |
 | [MoE 模型](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/docs/moe_models.md) | 模型、TP/EP 配置、组件归属与验证边界 |
 | [Qwen3 训练-推理一致性](docs/qwen3_training_inference_consistency.md) | Bit-Exact 定义、recipe 和验收门禁 |
 

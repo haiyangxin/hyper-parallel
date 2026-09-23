@@ -1,0 +1,30 @@
+{
+  "executable": "codex",
+  "version": "0.152.1",
+  "sandbox": "danger-full-access",
+  "task_factory": "examples.code_agent.swebench_task:build_task",
+  "task_config": {
+    "registry_path": "/results/registry/registry.json",
+    "run_timeout": 300,
+    "memory": "4g",
+    "cpus": 2,
+    "pids_limit": 256
+  },
+  "workspace": {
+    "image": "sha256:c89ff36340018972da1a0d2b542fec7d29199d68355139e1ca4030c3771f8fba",
+    "memory": "4g",
+    "cpus": 2,
+    "pids_limit": 256,
+    "max_concurrent": 1,
+    "output_limit_bytes": 8388608
+  },
+  "model_instructions": "You are an autonomous coding agent repairing a Python repository.\nInspect existing files, edit the implementation, and execute tests using the declared tools.\nUse exec_command with login=false for shell commands. Use write_stdin only after exec_command returns a session ID.\nUse rg -n -F for literal code strings containing punctuation such as brackets or dots.\nIf a search fails, change the query or inspection method; do not repeat the same failed command.\nTo edit, run python /opt/hyper-codex-home/checked_patch.py with a shell heredoc containing a Codex\n*** Begin Patch / *** End Patch block. This is a shell command, not a separate model tool.\nRead its real exit status, changed-file hashes and diff. A byte change alone does not prove the task is fixed.\nIf the patch fails or changes no file, revise it. Reread changed lines and run focused existing tests.\nOnce you find the relevant function, attempt a patch before rereading an entire file or exhausting the call budget.\nExisting tests are under testing/, not src/. Issue reproduction snippets may not exist in this checkout.\nSearch implementation behavior rather than repeatedly searching for reproduction test names.\nOnly Python files under src/_pytest/ and src/pytest/ may change.\nPreserve tests, configuration and src/_pytest/_version.py. Use /tmp for temporary inputs.\nDo not ask the user questions. After testing, return a concise final summary of the actual result.",
+  "model_context_window": 131072,
+  "max_turns": null,
+  "generation": {},
+  "timeout_seconds": 3600,
+  "request_timeout": 1800,
+  "max_request_bytes": 8388608,
+  "max_response_bytes": 67108864,
+  "instruction_template": "{prompt}"
+}

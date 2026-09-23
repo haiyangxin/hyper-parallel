@@ -70,6 +70,25 @@ class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row.metadata["episode_id"] for row in rows}, {"task:3:0"})
         self.assertEqual([row.reward for row in rows], [1.0, 1.0])
 
+    def test_repository_budget_status_preserves_all_sampled_call_evidence(self) -> None:
+        """Episode truncation does not rewrite individual engine finish reasons or tokens."""
+        records = [_record(0, [1, 2], [3, 9]), _record(1, [7, 8], [4, 9])]
+        records[0]["response"]["choices"][0]["finish_reason"] = "tool_calls"
+        baseline = build_codex_call_trajectories(completion_records=records, **_arguments())
+        truncated = build_codex_call_trajectories(
+            completion_records=records, metadata={"repository_budget_truncated": True}, **_arguments(),
+        )
+        for original, row in zip(baseline, truncated):
+            self.assertFalse(original.truncated)
+            self.assertEqual(original.terminal_reason, "completed")
+            self.assertTrue(row.truncated)
+            self.assertEqual(row.terminal_reason, "max_completions")
+            self.assertEqual(row.metadata["finish_reason"], original.metadata["finish_reason"])
+            self.assertEqual(row.metadata["gateway_record"], original.metadata["gateway_record"])
+            torch.testing.assert_close(row.token_ids, original.token_ids)
+            torch.testing.assert_close(row.action_mask, original.action_mask)
+            torch.testing.assert_close(row.rollout_log_probs, original.rollout_log_probs)
+
     def test_continuous_harness_requires_exact_full_prefix(self) -> None:
         """Dense DeepSeek/Codex APIs remain one row but never rewrite sampled history."""
         first = _record(0, [1, 2], [3, 9])
@@ -217,7 +236,9 @@ class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
         args = _arguments()
         captured = {"policy_version": 3, "completions": [_record(0, [1], [2])]}
         with patch.object(harness, "_load_reward_callable", return_value=lambda *values: 1.0):
-            program = harness.CodexAgentProgram(args["prompt"], 3, 0, "http://gateway", {}, 9)
+            program = harness.CodexAgentProgram(
+                args["prompt"], 3, 0, "http://gateway", {"reward_callable": "test:reward"}, 9,
+            )
         with (
             patch.object(program, "_write_codex_config"),
             patch.object(program, "_validate_version", new=AsyncMock()),
@@ -243,7 +264,9 @@ class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
                    "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
                    "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'done'}}))"]
         with patch.object(harness, "_load_reward_callable", return_value=lambda *values: 1.0):
-            program = harness.CodexAgentProgram(args["prompt"], 3, 0, "http://gateway", {"timeout_seconds": 2}, 9)
+            program = harness.CodexAgentProgram(
+                args["prompt"], 3, 0, "http://gateway", {"timeout_seconds": 2, "reward_callable": "test:reward"}, 9,
+            )
         with tempfile.TemporaryDirectory() as directory, patch.object(program, "_codex_command", return_value=command):
             path = Path(directory)
             result = await asyncio.wait_for(program._run_codex("test", path, path, path), 5)

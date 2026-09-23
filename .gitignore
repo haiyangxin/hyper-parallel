@@ -77,9 +77,7 @@ fusion_result.json
 *.xlsx
 
 # Local RL development instructions and generated runtime state
-/hyper_parallel/rl/AGENTS.md
 /hyper_parallel/rl/.cache/
 /hyper_parallel/rl/.codex/
 /hyper_parallel/rl/checkpoints/
 /hyper_parallel/rl/wandb/
-/hyper_parallel/rl/tests/trial/

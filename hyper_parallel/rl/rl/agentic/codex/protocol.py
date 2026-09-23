@@ -101,8 +101,9 @@ def _shell_action(arguments: Any) -> dict[str, Any]:
 class CodexResponsesProtocol:
     """Translate the protocol while rejecting lossy or unknown tool shapes."""
 
-    def transform_request(self, body: dict[str, Any], served_model: str) -> dict[str, Any]:
-        """Convert one Codex Responses request into a non-streaming vLLM request."""
+    def transform_request(self, body: dict[str, Any], served_model: str, *,
+                          request_training_evidence: bool = True) -> dict[str, Any]:
+        """Convert a Responses request into Chat, requesting training evidence by default."""
         if not isinstance(body, dict):
             raise ValueError("Responses request must be a JSON object")
         tools, namespace_aliases, _ = self._tools(self._request_tools(body))
@@ -121,10 +122,9 @@ class CodexResponsesProtocol:
             "model": served_model,
             "messages": self._merge_system_messages(messages),
             "stream": False,
-            "logprobs": True,
-            "top_logprobs": 0,
-            "return_token_ids": True,
         }
+        if request_training_evidence:
+            request.update(logprobs=True, top_logprobs=0, return_token_ids=True)
         for source, target in (
             ("max_output_tokens", "max_tokens"),
             ("temperature", "temperature"),
@@ -140,8 +140,8 @@ class CodexResponsesProtocol:
                 namespace_aliases,
             )
         reasoning = body.get("reasoning")
-        if isinstance(reasoning, dict) and reasoning.get("effort") not in {None, "none"}:
-            request["chat_template_kwargs"] = {"enable_thinking": True}
+        if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+            request["chat_template_kwargs"] = {"enable_thinking": reasoning["effort"] != "none"}
         return request
 
     def transform_response(

@@ -17,6 +17,7 @@
 import json
 import math
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -544,8 +545,10 @@ def _validate_gateway_config(config: Mapping[str, Any], prefix: str) -> None:
     if not 0 < port < 65536:
         raise ValueError(f"{prefix}.gateway_port must be in [1, 65535]")
     for name in ("timeout_seconds", "request_timeout"):
-        if float(config.get(name, 0.0)) <= 0.0:
+        if not math.isfinite(float(config.get(name, 0.0))) or float(config.get(name, 0.0)) <= 0.0:
             raise ValueError(f"{prefix}.{name} must be positive")
+    for name, default in (("max_request_bytes", 8 * 1024 * 1024), ("max_response_bytes", 32 * 1024 * 1024)):
+        _positive_integer({name: config.get(name, default)}, name, prefix)
 
 
 def _validate_codex_agentic(agentic: Mapping[str, Any]) -> None:
@@ -553,10 +556,22 @@ def _validate_codex_agentic(agentic: Mapping[str, Any]) -> None:
     codex = agentic.get("codex")
     if not isinstance(codex, Mapping):
         raise ValueError("agentic.codex must be a mapping for the Codex runner")
-    for name in ("version", "executable", "session_root", "reward_callable"):
+    for name in ("version", "executable", "session_root"):
         value = codex.get(name)
         if not isinstance(value, str) or not value:
             raise ValueError(f"agentic.codex.{name} must be a non-empty string")
+    instructions = codex.get("model_instructions")
+    if instructions is not None and (not isinstance(instructions, str) or not instructions.strip()):
+        raise ValueError("agentic.codex.model_instructions must be a non-empty string when configured")
+    task_factory, reward = codex.get("task_factory"), codex.get("reward_callable")
+    if (task_factory is None) == (reward is None):
+        raise ValueError("agentic.codex requires exactly one of task_factory and reward_callable")
+    selected = "task_factory" if task_factory is not None else "reward_callable"
+    callback = codex[selected]
+    if not isinstance(callback, str) or callback.count(":") != 1 or not all(callback.split(":")):
+        raise ValueError(f"agentic.codex.{selected} must use module:function syntax")
+    if task_factory is not None:
+        _validate_codex_workspace(codex)
     if codex["version"] != "0.152.1":
         raise ValueError("The Codex runner protocol is validated only for codex-cli 0.152.1")
     _validate_gateway_config(codex, "agentic.codex")
@@ -567,15 +582,73 @@ def _validate_codex_agentic(agentic: Mapping[str, Any]) -> None:
     _validate_codex_mcp_servers(codex)
 
 
+def _validate_codex_workspace(codex: Mapping[str, Any]) -> None:
+    """Validate the single offline candidate backend and trusted task configuration."""
+    _positive_integer(codex, "model_context_window", "agentic.codex")
+    workspace = required_mapping(codex, "workspace")
+    allowed = {"image", "memory", "cpus", "pids_limit", "max_concurrent", "output_limit_bytes", "run_id"}
+    if set(workspace) - allowed:
+        raise ValueError("agentic.codex.workspace contains unsupported settings")
+    image = workspace.get("image")
+    if not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
+        raise ValueError("agentic.codex.workspace.image must be a full sha256 image ID")
+    for name, default in (("pids_limit", 64), ("max_concurrent", 1), ("output_limit_bytes", 4 * 1024 * 1024)):
+        _positive_integer({name: workspace.get(name, default)}, name, "agentic.codex.workspace")
+    cpus = float(workspace.get("cpus", 1.0))
+    if not math.isfinite(cpus) or cpus <= 0:
+        raise ValueError("agentic.codex.workspace.cpus must be positive and finite")
+    task_config = codex.get("task_config", {})
+    if not isinstance(task_config, Mapping):
+        raise ValueError("agentic.codex.task_config must be a mapping")
+    if task_config.get("image", image) != image:
+        raise ValueError("Candidate and grader must use the same pinned image")
+    if codex.get("workspace_template") or codex.get("mcp_servers"):
+        raise ValueError("Repository tasks do not use host workspace templates or MCP servers")
+
+
+def _validate_deepseek_workspace(deepseek: Mapping[str, Any]) -> None:
+    """Apply the shared pinned candidate/grader contract to DeepSeek tasks."""
+    workspace = required_mapping(deepseek, "workspace")
+    allowed = {"image", "memory", "cpus", "pids_limit", "max_concurrent", "output_limit_bytes", "run_id"}
+    if set(workspace) - allowed:
+        raise ValueError("agentic.deepseek.workspace contains unsupported settings")
+    image = workspace.get("image")
+    if not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
+        raise ValueError("agentic.deepseek.workspace.image must be a full sha256 image ID")
+    for name, default in (("pids_limit", 64), ("max_concurrent", 1), ("output_limit_bytes", 4 * 1024 * 1024)):
+        _positive_integer({name: workspace.get(name, default)}, name, "agentic.deepseek.workspace")
+    cpus = float(workspace.get("cpus", 1.0))
+    if not math.isfinite(cpus) or cpus <= 0:
+        raise ValueError("agentic.deepseek.workspace.cpus must be positive and finite")
+    task_config = deepseek.get("task_config", {})
+    if not isinstance(task_config, Mapping):
+        raise ValueError("agentic.deepseek.task_config must be a mapping")
+    if task_config.get("image", image) != image:
+        raise ValueError("Candidate and grader must use the same pinned image")
+    if deepseek.get("workspace_template") or deepseek.get("mcp_servers"):
+        raise ValueError("Repository tasks do not use host workspace templates or MCP servers")
+
+
 def _validate_deepseek_agentic(agentic: Mapping[str, Any]) -> None:
     """Validate the pinned DeepSeek Harness execution contract."""
     deepseek = agentic.get("deepseek")
     if not isinstance(deepseek, Mapping):
         raise ValueError("agentic.deepseek must be a mapping for the DeepSeek runner")
-    for name in ("version", "provider", "model", "session_root", "reward_callable"):
+    for name in ("version", "provider", "model", "session_root"):
         value = deepseek.get(name)
         if not isinstance(value, str) or not value:
             raise ValueError(f"agentic.deepseek.{name} must be a non-empty string")
+    task_factory, reward = deepseek.get("task_factory"), deepseek.get("reward_callable")
+    if (task_factory is None) == (reward is None):
+        raise ValueError("agentic.deepseek requires exactly one of task_factory and reward_callable")
+    selected = "task_factory" if task_factory is not None else "reward_callable"
+    callback = deepseek[selected]
+    if not isinstance(callback, str) or callback.count(":") != 1 or not all(callback.split(":")):
+        raise ValueError(f"agentic.deepseek.{selected} must use module:function syntax")
+    if task_factory is not None:
+        _validate_deepseek_workspace(deepseek)
+        if deepseek.get("runtime_bin") is not None:
+            raise ValueError("Repository DeepSeek runtime binary is fixed by the pinned workspace image")
     if deepseek["version"] != "0.1.1rc1":
         raise ValueError(
             "The DeepSeek runner protocol is validated only for deepseek-harness-sdk 0.1.1rc1"
@@ -619,6 +692,23 @@ def _validate_external_agentic_rollout(
         raise ValueError(f"{display_name} tool evidence currently requires rollout.vllm.tool_call_parser=hermes")
     if int(vllm.get("port", 0)) == int(runner_config["gateway_port"]):
         raise ValueError(f"{display_name} gateway_port must differ from rollout.vllm.port")
+    if runner == "codex" and runner_config.get("task_factory") is not None:
+        context_window = _positive_integer(runner_config, "model_context_window", "agentic.codex")
+        model_limit = _positive_integer(vllm, "max_model_len", "rollout.vllm")
+        output_limit = _positive_integer(rollout, "max_new_tokens", "rollout")
+        # The pinned CLI starts compaction near 90% of its configured window.
+        # Leave room for one response and fixed overhead before vLLM's hard limit.
+        if context_window > model_limit or 9 * context_window // 10 + output_limit + 512 > model_limit:
+            raise ValueError(
+                "Repository Codex context reserve exceeds rollout.vllm.max_model_len: "
+                "require model_context_window <= max_model_len and "
+                "floor(0.9 * model_context_window) + rollout.max_new_tokens + 512 <= max_model_len"
+            )
+    if runner == "deepseek" and runner_config.get("task_factory") is not None:
+        model_limit = _positive_integer(vllm, "max_model_len", "rollout.vllm")
+        output_limit = _positive_integer(rollout, "max_new_tokens", "rollout")
+        if output_limit + 512 >= model_limit:
+            raise ValueError("Repository DeepSeek requires model context room beyond one output and 512 tokens")
 
 
 def validate_rollout_and_agentic(

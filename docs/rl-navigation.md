@@ -107,3 +107,14 @@ MoE、code 与外部 agent 的扩展 UT 已归入 `tests/ut/rl/` 对应模块。
 `hyper_parallel/rl/tests/st/test_feature_st.py` 提供 CPU/Gloo、真实沙箱和显式训练入口；
 其 worker 保留参数更新、策略版本及真实补齐检查，与原 dense/一致性/PPO 配方分别验收。
 测试配置与未运行项口径见 [功能与验证说明](../hyper_parallel/rl/docs/moe_code_agent.md)。
+
+## 8. 仓库级 Code Agent（开发分支）
+
+| 路径 | 配置/入口 | 实现 | 支持边界 | 验证 |
+| --- | --- | --- | --- | --- |
+| 仓库工作区与模型通道 | `examples/code_agent/task.py`、`rl/agentic.codex.task_factory`、`agentic.codex.model_context_window` | `rl/agentic/envs/docker_workspace.py`、`model_relay.py`、`rl/agentic/codex/{harness,gateway,checked_patch}.py` | 候选与判题容器隔离；管理凭证仅控制端持有，原始请求与采样保留；仓库任务限定两种真实工具并验证编辑字节，CLI 上下文窗口按模型服务配置 | `hyper_parallel/rl/tests/trial/test_{docker_workspace,model_relay,repository_program,gateway_transport,code_agent_edit_helper}.py` |
+| DeepSeek 仓库接线 | `examples/code_agent/configs/qwen3_30b_a3b_swebench_deepseek.yaml`；`agentic.deepseek.task_factory` | `rl/agentic/ds_harness/{harness,gateway}.py`、`rl/agentic/envs/model_relay.py`、`docker/Dockerfile.swebench-ds*` | DS runtime 在候选容器执行 `bash`；固定 Chat Completions、4 KiB 工具输出及原生摘要支持预算和停止后评分 | `hyper_parallel/rl/tests/trial/test_deepseek_repository_{config,gateway,program}.py`、`test_model_relay_chat.py`；[交接证据](../hyper_parallel/rl/docs/code_agent_handoff.md#deepseek-harness-对照工具输出与下一步动作) |
+| 外部 API 仅推理验收 | `examples/code_agent/inference.py` | `rl/agentic/codex/{gateway,protocol,harness}.py`；`CodexAgentProgram.run_inference` | 复用现有 CLI、工具、工作区与 grader；真实 API 调用记录和评分，不生成训练轨迹；密钥仅控制端持有 | [推理合同](../hyper_parallel/rl/examples/code_agent/README.md#外部-api-仅推理验收)；具体运行证据见交接记录 |
+| SWE-bench 小规模功能闭环 | `examples/code_agent/configs/qwen3_4b_swebench.yaml` | `examples/code_agent/swebench_{data,artifacts,task}.py` | 固定两例及官方评分；历史训练无有效修复或学习，外部 API 推理验收独立记录 | `hyper_parallel/rl/tests/trial/test_swebench_{artifacts,data,task,training}.py`；[当前推理证据](../hyper_parallel/rl/docs/code_agent_handoff.md#外部-api-仅推理验收2026-09-28) |
+
+接手顺序与未解决的空补丁问题见 [Code Agent 交接](../hyper_parallel/rl/docs/code_agent_handoff.md)。

@@ -96,10 +96,23 @@ def _validate_source_evidence(item: dict, choice: dict) -> Any:
     if not all(isinstance(item.get(key), str) for key in ("parser_input", "decoded_tokens", "engine_text")):
         return {"failure_origin": "unknown", "failure_reason": "incomplete_parser_evidence", "trainable": False}
     blocks = _BLOCK.findall(item["parser_input"])
+    engine_blocks = _BLOCK.findall(item["engine_text"])
     if (not isinstance(item.get("token_ids"), list) or not item["token_ids"]
             or item["token_ids"] != choice.get("token_ids")
-            or blocks != _BLOCK.findall(item["decoded_tokens"])
-            or blocks != _BLOCK.findall(item["engine_text"])):
+            or engine_blocks != _BLOCK.findall(item["decoded_tokens"])):
+        return {"failure_origin": "unknown", "failure_reason": "parser_input_mismatch", "trainable": False}
+    if "reasoning_parser" in item:
+        evidence = item["reasoning_parser"]
+        message = choice.get("message", {})
+        if (not isinstance(evidence, dict)
+                or evidence.get("source") != "Qwen3ReasoningParser.extract_reasoning"
+                or not isinstance(evidence.get("reasoning"), str)
+                or evidence.get("parser_input") != item["engine_text"]
+                or evidence.get("content") != item["parser_input"]
+                or any(message.get(key) is not None and message[key] != evidence["reasoning"]
+                       for key in ("reasoning", "reasoning_content"))):
+            return {"failure_origin": "unknown", "failure_reason": "reasoning_parser_mismatch", "trainable": False}
+    elif blocks != engine_blocks:
         return {"failure_origin": "unknown", "failure_reason": "parser_input_mismatch", "trainable": False}
     return None
 
@@ -135,11 +148,13 @@ def install_tool_evidence() -> None:
     # Optional server dependency: this module is also used by CPU-only training code.
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat  # pylint: disable=C0415
     from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser  # pylint: disable=C0415
+    from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser  # pylint: disable=C0415
 
     original = OpenAIServingChat.chat_completion_full_generator
     if getattr(original, "hyper_tool_evidence", False):
         return
     parse = Hermes2ProToolParser.extract_tool_calls
+    extract_reasoning = Qwen3ReasoningParser.extract_reasoning
 
     @wraps(parse)
     def capture_parser(self: Any, model_output: str, request: Any) -> Any:
@@ -147,8 +162,24 @@ def install_tool_evidence() -> None:
         result = parse(self, model_output, request)
         capture = _CAPTURE.get()
         if capture is not None:
-            capture.append({"parser_input": model_output, "parser_result": result.model_dump(),
-                            "source": "Hermes2ProToolParser.extract_tool_calls"})
+            evidence = {"invalid": "cross_request_tool_capture"}
+            if request is capture["request"]:
+                evidence = {"parser_input": model_output, "parser_result": result.model_dump(),
+                            "source": "Hermes2ProToolParser.extract_tool_calls"}
+            capture["tools"].append(evidence)
+        return result
+
+    @wraps(extract_reasoning)
+    def capture_reasoning(self: Any, model_output: str, request: Any) -> Any:
+        """Record the actual Qwen3 split, never derive a new split from output strings."""
+        result = extract_reasoning(self, model_output, request)
+        capture = _CAPTURE.get()
+        if capture is not None:
+            evidence = {"invalid": "cross_request_reasoning_capture"}
+            if request is capture["request"]:
+                evidence = {"source": "Qwen3ReasoningParser.extract_reasoning", "parser_input": model_output,
+                            "reasoning": result[0], "content": result[1]}
+            capture["reasoning"].append(evidence)
         return result
 
     @wraps(original)
@@ -157,6 +188,7 @@ def install_tool_evidence() -> None:
                                reasoning_parser: Any = None) -> Any:
         """Attach one-call evidence only when both engine output and parser capture are unambiguous."""
         capture = []
+        reasoning_capture = []
         outputs = []
 
         async def observe() -> Any:
@@ -165,7 +197,8 @@ def install_tool_evidence() -> None:
                 outputs[:] = result.outputs
                 yield result
 
-        token = _CAPTURE.set(capture if request.return_token_ids else None)
+        context = {"request": request, "tools": capture, "reasoning": reasoning_capture}
+        token = _CAPTURE.set(context if request.return_token_ids else None)
         try:
             response = await original(self, request, observe(), request_id, model_name,
                                       conversation, tokenizer, request_metadata, reasoning_parser)
@@ -175,6 +208,11 @@ def install_tool_evidence() -> None:
                     engine_text=output.text, token_ids=list(output.token_ids), request_id=request_id,
                     decoded_tokens=tokenizer.decode(output.token_ids, skip_special_tokens=False),
                 )
+                if reasoning_parser is not None or reasoning_capture:
+                    evidence = (reasoning_capture[0] if len(reasoning_capture) == 1
+                                else {"invalid": "missing_or_ambiguous_reasoning_capture"})
+                    if evidence.get("reasoning") is not None or "invalid" in evidence:
+                        capture[0]["reasoning_parser"] = evidence
                 response.__pydantic_extra__ = {**(response.model_extra or {}), "hyper_tool_protocol": capture}
             return response
         finally:
@@ -182,4 +220,5 @@ def install_tool_evidence() -> None:
 
     capture_response.hyper_tool_evidence = True
     Hermes2ProToolParser.extract_tool_calls = capture_parser
+    Qwen3ReasoningParser.extract_reasoning = capture_reasoning
     OpenAIServingChat.chat_completion_full_generator = capture_response
