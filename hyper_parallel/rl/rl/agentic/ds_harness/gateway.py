@@ -258,12 +258,8 @@ class _State:
             "session_id": session_id,
             "payload": payload,
         }
-        with (
-            self.lock,
-            (session.artifact_dir / "gateway-events.jsonl").open(
-                "a", encoding="utf-8"
-            ) as stream,
-        ):
+        event_path = session.artifact_dir / "gateway-events.jsonl"
+        with self.lock, event_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 

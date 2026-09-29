@@ -480,7 +480,6 @@ def _rollout_samples(
     sample_limit: int,
 ) -> list[dict[str, Any]]:
     """Render bounded episode samples without counting each model call as a candidate."""
-    rank = dist.get_rank()
     batch_rows = {
         str(prompt_id): row
         for row, prompt_id in enumerate(batch.get("prompt_ids", batch["sample_indices"]))
@@ -493,7 +492,7 @@ def _rollout_samples(
         samples.append(
             {
                 "step": step,
-                "rank": rank,
+                "rank": dist.get_rank(),
                 "prompt": batch["prompts"][batch_row],
                 "response": response,
                 **({"ground_truth": batch["ground_truths"][batch_row]}

@@ -14,6 +14,24 @@
 # ============================================================================
 """Model identity and role construction shared by training and rollout."""
 
+__all__ = [
+    "HYPER_MODEL_IMPLEMENTATION",
+    "HYPER_QWEN3_ARCHITECTURE",
+    "ModelRegistration",
+    "NATIVE_MODEL_IMPLEMENTATION",
+    "NATIVE_QWEN3_ARCHITECTURE",
+    "NATIVE_QWEN3_MOE_ARCHITECTURE",
+    "SUPPORTED_MODEL_IMPLEMENTATIONS",
+    "VLLMModelRegistration",
+    "architecture_for_implementation",
+    "build_role_model",
+    "build_role_optimizer",
+    "iter_hsdp_roots",
+    "normalize_model_implementation",
+    "resolve_vllm_model",
+]
+
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,24 +193,6 @@ def iter_hsdp_roots(model: torch.nn.Module) -> Iterator[HSDPModule]:
             yield candidate
 
 
-__all__ = [
-    "HYPER_MODEL_IMPLEMENTATION",
-    "HYPER_QWEN3_ARCHITECTURE",
-    "ModelRegistration",
-    "NATIVE_MODEL_IMPLEMENTATION",
-    "NATIVE_QWEN3_ARCHITECTURE",
-    "NATIVE_QWEN3_MOE_ARCHITECTURE",
-    "SUPPORTED_MODEL_IMPLEMENTATIONS",
-    "VLLMModelRegistration",
-    "architecture_for_implementation",
-    "build_role_model",
-    "build_role_optimizer",
-    "iter_hsdp_roots",
-    "normalize_model_implementation",
-    "resolve_vllm_model",
-]
-
-
 def _model_boolean(model: Mapping[str, Any], name: str, default: bool) -> bool:
     """Return one validated Boolean model option."""
     value = model.get(name, default)
@@ -258,7 +258,7 @@ def resolve_model(model: Mapping[str, Any]) -> ModelRegistration:
     )
     # Validate checkpoint identity and loader options before runtime construction.
     _ = registration.family
-    model_trust_remote_code(model)
-    tokenizer_trust_remote_code(model)
-    trainer_attention_implementation(model)
+    _ = model_trust_remote_code(model)
+    _ = tokenizer_trust_remote_code(model)
+    _ = trainer_attention_implementation(model)
     return registration

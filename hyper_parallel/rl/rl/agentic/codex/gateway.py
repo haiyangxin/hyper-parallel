@@ -235,7 +235,7 @@ class _Handler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(self.server.state.request_timeout)
 
-    def do_GET(self) -> None:  # pylint: disable=C0103
+    def _handle_get(self) -> None:
         """Serve health and captured-session inspection."""
         path = urlparse(self.path).path
         if path == "/healthz":
@@ -256,7 +256,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._error(HTTPStatus.NOT_FOUND, "Unknown gateway route")
 
-    def do_POST(self) -> None:  # pylint: disable=C0103
+    def _handle_post(self) -> None:
         """Register a session or proxy one Responses request."""
         try:
             body = self._request_json()
@@ -286,7 +286,7 @@ class _Handler(BaseHTTPRequestHandler):
             logger.exception("Codex gateway request failed")
             self._error(HTTPStatus.BAD_GATEWAY, str(error))
 
-    def do_DELETE(self) -> None:  # pylint: disable=C0103
+    def _handle_delete(self) -> None:
         """Release a captured session after its trajectory is materialized."""
         path = urlparse(self.path).path
         prefix = "/internal/sessions/"
@@ -461,8 +461,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     # BaseHTTPRequestHandler's first argument is positional; avoid shadowing the format builtin.
     def log_message(self, format_string: str, *args: Any) -> None:  # pylint: disable=arguments-differ
-        """Route HTTP server diagnostics through the application logger."""
-        logger.debug("Codex gateway: " + format_string, *args)
+        """Write HTTP diagnostics through the gateway logger."""
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Codex gateway: %s", format_string % args if args else format_string)
+
+    # BaseHTTPRequestHandler dispatches by these exact attribute names.
+    do_GET = _handle_get  # pylint: disable=invalid-name
+    do_POST = _handle_post  # pylint: disable=invalid-name
+    do_DELETE = _handle_delete  # pylint: disable=invalid-name
 
 
 class _GatewayServer(ThreadingHTTPServer):

@@ -13,6 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Distributed evaluation for the synchronous RL trainer."""
+
+__all__ = ["Evaluator"]
+
 import logging
 from typing import Any, Callable, Optional
 
@@ -145,8 +148,7 @@ class Evaluator:
         sample_limit: int,
     ) -> dict[str, Any]:
         """Generate and score one padded evaluation batch."""
-        samples = [self.dataset[sample_index] for sample_index, _ in entries]
-        batch = self.collate_fn(samples)
+        batch = self.collate_fn([self.dataset[sample_index] for sample_index, _ in entries])
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
         rollout = self.rollout_manager.generate(
@@ -227,4 +229,3 @@ class Evaluator:
             total,
         )
         return metrics, select_round_robin_samples(records, self.log_samples)
-__all__ = ["Evaluator"]

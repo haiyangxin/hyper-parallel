@@ -124,18 +124,19 @@ def shared_endpoint(client: VLLMWeightSyncClientMixin) -> str:
     return str(endpoints[0])
 
 
-def _worker_layout_coordinates(workers, data_parallel_size, tensor_parallel_size):
+def _worker_layout_coordinates(
+    workers: list[Mapping[str, Any]], data_parallel_size: int, tensor_parallel_size: int,
+) -> dict[tuple[int, int], Mapping[str, Any]]:
     """Validate worker topology and complete TP replicas before selecting routes."""
     by_coordinate = {}
     for worker in workers:
         coordinate = (int(worker["dp_rank"]), int(worker["tp_rank"]))
-        if (
-            coordinate in by_coordinate
-            or int(worker["dp_size"]) not in (1, data_parallel_size)
-            or int(worker["tp_size"]) != tensor_parallel_size
-            or not 0 <= coordinate[0] < data_parallel_size
-            or not 0 <= coordinate[1] < tensor_parallel_size
-        ):
+        if coordinate in by_coordinate:
+            raise RuntimeError(f"Direct reshard worker has invalid topology: {worker}")
+        if (int(worker["dp_size"]) not in (1, data_parallel_size)
+                or int(worker["tp_size"]) != tensor_parallel_size):
+            raise RuntimeError(f"Direct reshard worker has invalid topology: {worker}")
+        if not 0 <= coordinate[0] < data_parallel_size or not 0 <= coordinate[1] < tensor_parallel_size:
             raise RuntimeError(f"Direct reshard worker has invalid topology: {worker}")
         by_coordinate[coordinate] = worker
     dp_ranks = sorted({coordinate[0] for coordinate in by_coordinate})
@@ -173,12 +174,19 @@ def direct_reshard_workers(
             f"Direct reshard rollout returned invalid layouts: {workers}"
         )
     by_coordinate = _worker_layout_coordinates(workers, data_parallel_size, tensor_parallel_size)
-    dp_ranks = sorted({coordinate[0] for coordinate in by_coordinate})
     if any(worker.get("model_type") == "qwen3_moe" for worker in workers):
         if len(by_coordinate) != expected_world_size:
             raise RuntimeError("Expert parallel layouts require every DP x TP worker")
         return [dict(worker, worker_rank=dp * tensor_parallel_size + tp)
                 for (dp, tp), worker in sorted(by_coordinate.items())]
+    return _representative_direct_workers(by_coordinate, tensor_parallel_size)
+
+
+def _representative_direct_workers(
+    by_coordinate: Mapping[tuple[int, int], Mapping[str, Any]], tensor_parallel_size: int,
+) -> list[Mapping[str, Any]]:
+    """Select one DP replica after confirming all copies expose equal TP layouts."""
+    dp_ranks = sorted({coordinate[0] for coordinate in by_coordinate})
     representative_dp_rank = dp_ranks[0]
     representatives = []
     for tp_rank in range(tensor_parallel_size):

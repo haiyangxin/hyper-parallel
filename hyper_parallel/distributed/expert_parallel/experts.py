@@ -98,6 +98,49 @@ def resolve_swiglu_weights(
     return w_gate, w_up, w_down
 
 
+def _run_grouped_swiglu_expert_forward(experts, sorted_states, local_expert_counts):
+    """Run the grouped GEMM implementation for sorted expert tokens."""
+    grouped_forward = getattr(experts, "forward_expert_major", None)
+    if callable(grouped_forward):
+        return grouped_forward(sorted_states, local_expert_counts)
+    gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
+    if up_weight is not None:
+        raise ValueError("EP grouped GEMM currently requires packed gate_up_proj weights")
+    return npu_grouped_swiglu(
+        sorted_states,
+        gate_weight,
+        down_weight,
+        local_expert_counts,
+    )
+
+
+def _run_per_expert_swiglu_forward(experts, sorted_states, local_expert_counts):
+    """Run the per-expert SwiGLU implementation for sorted tokens."""
+    gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
+    sorted_outputs = []
+    token_start = 0
+    for local_expert_index in range(experts.local_expert_count):
+        expert_token_count = int(local_expert_counts[local_expert_index])
+        expert_states = sorted_states[token_start:token_start + expert_token_count]
+        if up_weight is None:
+            gate_states, up_states = F.linear(  # pylint: disable=not-callable
+                expert_states,
+                gate_weight[local_expert_index],
+            ).chunk(2, dim=-1)
+        else:
+            gate_states = F.linear(expert_states, gate_weight[local_expert_index])
+            up_states = F.linear(expert_states, up_weight[local_expert_index])
+        activation = getattr(experts, "ep_act_fn", F.silu)
+        sorted_outputs.append(
+            F.linear(  # pylint: disable=not-callable
+                activation(gate_states) * up_states,
+                down_weight[local_expert_index],
+            )
+        )
+        token_start += expert_token_count
+    return torch.cat(sorted_outputs)
+
+
 def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):
     """Compute dispatched tokens with the local stacked SwiGLU experts.
 
@@ -113,53 +156,15 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
         minlength=experts.local_expert_count,
     )
     if getattr(experts, "ep_use_grouped_gemm", False):
-        grouped_forward = getattr(experts, "forward_expert_major", None)
-        if callable(grouped_forward):
-            sorted_output = grouped_forward(sorted_states, local_expert_counts)
-        else:
-            gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
-            if up_weight is not None:
-                raise ValueError(
-                    "EP grouped GEMM currently requires packed gate_up_proj weights"
-                )
-            sorted_output = npu_grouped_swiglu(
-                sorted_states,
-                gate_weight,
-                down_weight,
-                local_expert_counts,
-            )
+        sorted_output = _run_grouped_swiglu_expert_forward(
+            experts, sorted_states, local_expert_counts
+        )
         output = torch.empty_like(sorted_output)
         output[token_order] = sorted_output
         return output
-
-    gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
-    sorted_outputs = []
-    token_start = 0
-    for local_expert_index in range(experts.local_expert_count):
-        expert_token_count = int(local_expert_counts[local_expert_index])
-        expert_states = sorted_states[token_start:token_start + expert_token_count]
-        if up_weight is None:
-            gate_states, up_states = F.linear(  # pylint: disable=not-callable
-                expert_states,
-                gate_weight[local_expert_index],
-            ).chunk(2, dim=-1)
-        else:
-            gate_states = F.linear(  # pylint: disable=not-callable
-                expert_states, gate_weight[local_expert_index]
-            )
-            up_states = F.linear(  # pylint: disable=not-callable
-                expert_states, up_weight[local_expert_index]
-            )
-        activation = getattr(experts, "ep_act_fn", F.silu)
-        sorted_outputs.append(
-            F.linear(  # pylint: disable=not-callable
-                activation(gate_states) * up_states,
-                down_weight[local_expert_index],
-            )
-        )
-        token_start += expert_token_count
-
-    sorted_output = torch.cat(sorted_outputs)
+    sorted_output = _run_per_expert_swiglu_forward(
+        experts, sorted_states, local_expert_counts
+    )
     output = torch.empty_like(sorted_output)
     output[token_order] = sorted_output
     return output
@@ -233,23 +238,21 @@ def _prepare_ep_dispatch(
 ) -> _EPDispatch:
     """Sort routed tokens and exchange per-rank dispatch counts."""
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-    token_count = flattened_states.shape[0]
-    experts_per_token = topk_indices.shape[1]
-    expert_indices = topk_indices.reshape(-1)
-    expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
     source_indices = torch.arange(
-        token_count, device=flattened_states.device
-    ).repeat_interleave(experts_per_token)
-    destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
-    dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
+        flattened_states.shape[0], device=flattened_states.device
+    ).repeat_interleave(topk_indices.shape[1])
+    topk_indices = topk_indices.reshape(-1)
+    topk_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
+    destination_ranks = torch.div(topk_indices, local_expert_count, rounding_mode="floor")
+    dispatch_order = (destination_ranks * global_expert_count + topk_indices).argsort()
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
-    dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
+    dispatched_indices = topk_indices[dispatch_order].unsqueeze(-1).contiguous()
     send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
     receive_counts_tensor = torch.empty_like(send_counts_tensor)
     dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
     return _EPDispatch(
         source_indices=source_indices,
-        expert_weights=expert_weights,
+        expert_weights=topk_weights,
         dispatch_order=dispatch_order,
         states=dispatched_states,
         expert_indices=dispatched_indices,
