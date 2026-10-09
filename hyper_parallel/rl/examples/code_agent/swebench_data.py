@@ -39,11 +39,29 @@ def adapt_row(row: Mapping[str, Any], index: int) -> PromptRecord:
     if row.get("task_id") != task_id:
         raise ValueError("SWE-bench row identity differs from its registry identity")
     messages = tuple(Message(item["role"], item["content"]) for item in row["prompt"])
-    return PromptRecord(task_id, messages, dict(truth), {"task_type": "swebench_verified", "task_id": task_id})
+    prompt_id = task_id
+    metadata = {"task_type": "swebench_verified", "task_id": task_id}
+    if "replica_index" in row:
+        replica_index = row["replica_index"]
+        if isinstance(replica_index, bool) or not isinstance(replica_index, int) or replica_index < 0:
+            raise ValueError("SWE-bench replica_index must be a non-negative integer")
+        if replica_index > 0:
+            prompt_id = f"{task_id}:replica:{replica_index}"
+            metadata["replica_index"] = replica_index
+    return PromptRecord(prompt_id, messages, dict(truth), metadata)
 
 
-def prepare_data(registry_path: Path, output: Path) -> None:
-    """Write only public issues and opaque identities for the approved functional set."""
+def prepare_data(registry_path: Path, output: Path, *, repeats: int = 1) -> None:
+    """Write public issues with optional sampling identities for repeated instances.
+
+    Args:
+        registry_path: Controller-owned instance registry.
+        output: Destination parquet file.
+        repeats: Number of copies per instance. Repeats provide distributed
+            functional coverage, not independent evaluation or a benchmark.
+    """
+    if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats <= 0:
+        raise ValueError("SWE-bench repeats must be a positive integer")
     raw = registry_path.read_bytes()
     registry = json.loads(raw)
     if registry.get("schema_version") != 1 or not registry.get("instances"):
@@ -64,6 +82,9 @@ def prepare_data(registry_path: Path, output: Path) -> None:
                 "and src/pytest/ may change; preserve tests, configuration and src/_pytest/_version.py. "
                 "Use /tmp for scratch files. The repository is offline.\n\n" + issue)}],
         })
+    if repeats > 1:
+        rows = [{**row, "replica_index": replica_index}
+                for replica_index in range(repeats) for row in rows]
     output.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(rows), output)
 
@@ -73,8 +94,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--repeats", type=int, default=1, help="Copies per instance for distributed functional runs")
     args = parser.parse_args()
-    prepare_data(args.registry, args.output)
+    prepare_data(args.registry, args.output, repeats=args.repeats)
 
 
 if __name__ == "__main__":

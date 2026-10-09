@@ -18,8 +18,6 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
-from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
-from hyper_parallel.core.utils import clip_grad_norm_
 from rl.algorithm.loss import RLAlgorithm
 from rl.consistency import trainer_sequence_log_probs
 from rl.dataset.contracts import ExperienceBatch
@@ -28,6 +26,9 @@ from rl.utils.monitoring.metrics import (
     ActorMicroBatchMetrics,
     ActorUpdateMetrics,
 )
+
+from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
+from hyper_parallel.core.utils import clip_grad_norm_
 
 
 # Role execution uses explicit compute/update APIs; forward remains the Module default.
@@ -99,6 +100,17 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         )
         if packed_log_probs is not None:
             return packed_log_probs
+        if getattr(self.actor_model, "supports_token_log_probs", False):
+            log_probs = self.actor_model(
+                input_ids=sequences,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_token_log_probs=True,
+            )
+            if (not isinstance(log_probs, torch.Tensor) or log_probs.dtype != torch.float32
+                    or tuple(log_probs.shape) != (sequences.shape[0], sequences.shape[1] - 1)):
+                raise ValueError("Model token probabilities must be FP32 [batch, sequence_length - 1]")
+            return log_probs
         outputs = self.actor_model(
             input_ids=sequences,
             attention_mask=attention_mask,

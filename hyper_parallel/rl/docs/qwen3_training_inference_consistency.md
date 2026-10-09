@@ -15,7 +15,7 @@ sharding plan；训练侧使用可反向传播的 attention 路径，推理侧�
 执行边界在固定 Ascend recipe 下产生相同的 selected-token raw logprobs。
 
 检查仅覆盖更新前的 selected-token raw logprobs，不覆盖 Native-vLLM、其他模型、TP4/TP8、
-梯度、optimizer state、更新后参数或收敛表现。各拓扑的验收以对应[系统测试](hyper-rl-st.md)为准。
+梯度、optimizer state、更新后参数或收敛表现。各拓扑的验收以对应[系统测试](../README.md#系统测试)为准。
 
 ## Bit-Exact 定义
 
@@ -74,6 +74,24 @@ consistency:
 
 训练侧 FA2 backward 与推理侧 FA3 KV-cache 是不同的执行路径，需要在固定配置下成对验证。
 固定依赖与镜像下载见[运行镜像](../docker/README.md)。
+
+数值合同仍为 `qwen3_ascend_consistency_v1`；依赖适配版本与数值合同分别记录。
+`consistency_runtime_state().dependency_runtime` 标识实际选中的运行时组合，不会根据宿主版本改变数值合同。
+
+| 运行时组合 | vLLM | vLLM-Ascend | 额外 ABI 约束 | 验收状态 |
+| --- | --- | --- | --- | --- |
+| `vllm_ascend_0221` | 0.22.1 | 0.22.1rc1 | 沿用原组合 | 原系统测试范围 |
+| `vllm_ascend_0230_post1` | 0.23.0 | 0.23.0.post1 | Torch 2.10.0、torch-npu 2.10.0.post4 | Qwen3-4B colocated TP1/TP2 真实 NPU bit-exact 已通过；LR=0，学习未验 |
+
+两组都要求 Transformers 5.5.4、FlashAttentionNPU 0.2.0b1 和 batch-invariant-ops 1.0.0。
+发行版本的 `+` 本地构建后缀允许不同；混合 vLLM/Ascend 版本、其他发布版本或不匹配的新组合 Torch ABI 会被拒绝。
+0.23 组合保留原模型、FA2/FA3、RNG 回滚和全部 selected-token FP32 bit-pattern 门禁；
+新版私有生命周期 hook 和统一 Parser 接口的兼容测试不能代替真实模型系统测试。
+
+0.23 正式验收在 TP1 和 TP2 各运行两步，保留 512 个新 token 的原预算及全部实际动作。
+按真实 DP 样本去重后，TP1 比较 15,163 个 action token，TP2 比较 7,367 个，合计 22,530 个；
+全部 FP32 位模式 mismatch、max/mean absolute difference 均为零，原 token、mask、finite 和版本门禁通过。
+两组均使用 LR=0 冻结权重；该结果验证更新前数值一致性，不证明非零更新后的有效学习。
 
 缺少依赖、版本不符、非 eager、非 Qwen3、非 Hyper-vLLM 或 TP degree 不匹配时 fail closed。
 

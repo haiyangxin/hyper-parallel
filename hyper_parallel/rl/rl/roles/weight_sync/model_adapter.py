@@ -224,7 +224,7 @@ def build_model_weight_adapter(
     model: VLLMModelRegistration,
 ) -> ModelWeightAdapter:
     """Return the adapter owned by one registered model family."""
-    if model.family in ("qwen3", "qwen3_moe"):
+    if model.family in ("qwen3", "qwen3_moe", "qwen3_5"):
         return ModelWeightAdapter(model)
     raise ValueError(f"Unsupported weight-sync model family: {model.family!r}")
 
@@ -242,7 +242,8 @@ def alias_tied_embeddings(
     """Expose both tied checkpoint names without allocating another tensor."""
     if not model.model.tie_word_embeddings:
         return state_dict
-    embedding_name = "model.embed_tokens.weight"
+    embedding_name = ("model.language_model.embed_tokens.weight" if model.family == "qwen3_5"
+                      else "model.embed_tokens.weight")
     lm_head_name = "lm_head.weight"
     if embedding_name in state_dict and lm_head_name not in state_dict:
         state_dict[lm_head_name] = state_dict[embedding_name]

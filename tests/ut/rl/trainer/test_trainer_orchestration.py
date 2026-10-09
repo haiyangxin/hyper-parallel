@@ -17,8 +17,10 @@
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
 # pylint: disable=forbidden-backend-import,missing-public-docstring,protected-access,unnecessary-lambda
 
+import gc
+import weakref
 from types import MethodType, SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import Mock
 
 import pytest
@@ -32,6 +34,13 @@ from rl.dataset.contracts import ExperienceBatch
 from rl.roles import Actor
 from rl.trainer import SyncTrainer
 from rl.utils.monitoring.metrics import ActorUpdateMetrics
+
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.fully_shard.api import HSDPModule
+from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
+from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2
+from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, FSDPMeshInfo, MixedPrecisionPolicy
 
 
 def _rollout() -> ExperienceBatch:
@@ -51,7 +60,7 @@ def _rollout() -> ExperienceBatch:
 @pytest.mark.parametrize("failed_stage", [None, "_setup_runtime", "_build_runtime"])
 def test_trainer_initializes_batch_invariant_settings_before_distributed_runtime(
     monkeypatch: pytest.MonkeyPatch,
-    failed_stage: str | None,
+    failed_stage: Optional[str],
 ) -> None:
     """Configuration and deterministic communication precede runtime setup."""
     calls: list[str] = []
@@ -215,12 +224,14 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
 
         @staticmethod
         def compute_log_probs(unused_experience: ExperienceBatch) -> torch.Tensor:
+            """Record Actor inference and return the prepared log-probabilities."""
             del unused_experience
             calls.append("actor-logprobs")
             return actor_log_probs
 
         @staticmethod
         def update(experience: ExperienceBatch) -> Any:
+            """Record Actor optimization after training targets are prepared."""
             assert experience is not None
             calls.append("actor-update")
             return SimpleNamespace(optimizer_steps=1)
@@ -228,6 +239,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
     class ReferenceRole:
         @staticmethod
         def compute_log_probs(unused_experience: ExperienceBatch) -> torch.Tensor:
+            """Record Reference inference and return fixed log-probabilities."""
             del unused_experience
             calls.append("reference")
             return reference_log_probs
@@ -236,12 +248,14 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
         """Record bootstrapped value inference and the separate Critic update."""
         @staticmethod
         def compute_values(unused_experience: ExperienceBatch, *, include_last: bool = False) -> torch.Tensor:
+            """Record Critic inference and supply the requested bootstrap context."""
             del unused_experience
             calls.append("critic-values")
             return torch.cat((values, values[:, -1:]), dim=1) if include_last else values
 
         @staticmethod
         def update(unused_experience: ExperienceBatch) -> Any:
+            """Record the independent Critic optimization step."""
             del unused_experience
             calls.append("critic-update")
             return SimpleNamespace()
@@ -264,6 +278,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
             return experience
 
     def complete_step(self: SyncTrainer, **kwargs: Any) -> None:
+        """Record step completion and advance the trainer state."""
         assert kwargs["step"] == 1
         assert kwargs["critic_update"] is not None
         assert kwargs["diagnostic_metrics"] == {
@@ -300,6 +315,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
         "critic-values",
         "targets",
         "diagnostics",
+        "release",
         "actor-update",
         "actor-logprobs",
         "post-update-check",
@@ -359,6 +375,7 @@ def test_trainer_completes_metrics_and_evaluation_after_published_step(
     actor_update = ActorUpdateMetrics(0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 1.0, 0.01, 2, 1)
 
     def summarize(*_args: Any, **_kwargs: Any) -> tuple[dict[str, float], list[Any]]:
+        """Return the rollout summary after the trainer step advances."""
         assert trainer.state.global_step == 1
         calls.append("summarize")
         return {"reward/mean": 1.0}, []
@@ -434,18 +451,22 @@ def test_trainer_runs_one_complete_synchronous_training_step(
 
         @staticmethod
         def prepare_for_training() -> None:
+            """Record the transition from rollout to training residency."""
             calls.append("prepare-training")
 
         @staticmethod
         def update_weights(snapshot: Any) -> None:
+            """Record publication of the supplied policy version."""
             calls.append(f"publish:{snapshot.version}")
 
         @staticmethod
         def prepare_for_rollout() -> None:
+            """Record the transition back to rollout residency."""
             calls.append("prepare-rollout")
 
         @staticmethod
         def close() -> None:
+            """Record engine shutdown at the end of training."""
             calls.append("engine-close")
 
     class ActorRole:
@@ -454,11 +475,13 @@ def test_trainer_runs_one_complete_synchronous_training_step(
 
         @staticmethod
         def compute_log_probs(experience: ExperienceBatch) -> torch.Tensor:
+            """Record Actor inference and return independent old log-probabilities."""
             calls.append("actor-logprobs")
             return experience.old_log_probs.clone()
 
         @staticmethod
         def update(experience: ExperienceBatch) -> ActorUpdateMetrics:
+            """Record Actor optimization on the prepared rollout."""
             assert experience is rollout
             calls.append("actor-update")
             return ActorUpdateMetrics(0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 1.0, 0.01, 1, 1)
@@ -466,12 +489,14 @@ def test_trainer_runs_one_complete_synchronous_training_step(
     class ReferenceRole:
         @staticmethod
         def compute_log_probs(experience: ExperienceBatch) -> torch.Tensor:
+            """Record Reference inference and return fixed target log-probabilities."""
             calls.append("reference")
             return torch.zeros_like(experience.old_log_probs)
 
     class Preparer:
         @staticmethod
         def prepare(experience: ExperienceBatch, **kwargs: Any) -> ExperienceBatch:
+            """Record target preparation after required role outputs arrive."""
             assert kwargs["reference_log_probs"] is not None
             calls.append("targets")
             return experience
@@ -480,11 +505,13 @@ def test_trainer_runs_one_complete_synchronous_training_step(
     class Tracker:
         @staticmethod
         def log(unused_metrics: Any, *, step: int, **_kwargs: Any) -> None:
+            """Record logging of the completed training step."""
             del unused_metrics
             calls.append(f"log:{step}")
 
         @staticmethod
         def finish() -> None:
+            """Record tracker shutdown at the end of training."""
             calls.append("tracker-finish")
 
     trainer.rollout_engine = Engine()
@@ -591,10 +618,12 @@ def test_trainer_builds_tokenizer_data_and_dataloader(
 
         @property
         def pad_token(self) -> str:
+            """Expose the EOS token as the fake tokenizer padding token."""
             return self.eos_token
 
         @pad_token.setter
         def pad_token(self, value: str) -> None:
+            """Validate and record assignment of the fake padding token."""
             assert value == self.eos_token
             self.pad_token_id = self.eos_token_id
 
@@ -610,6 +639,7 @@ def test_trainer_builds_tokenizer_data_and_dataloader(
     sampler = object()
 
     def build_dataloader(dataset: Any, collate_fn: Any, **kwargs: Any) -> tuple[Any, Any]:
+        """Record loader construction and return its loader and sampler."""
         calls.append(("loader", dataset, collate_fn, kwargs))
         return loader, sampler
 
@@ -675,12 +705,14 @@ def test_trainer_builds_rollout_evaluator_and_tp_request_owner(
 
     class Engine:
         def configure_trainer_tensor_parallel(self, **kwargs: Any) -> None:
+            """Record tensor-parallel runtime configuration arguments."""
             calls.append(("tp", kwargs))
 
     engine = Engine()
     managers: list[Any] = []
 
     def manager(**kwargs: Any) -> Any:
+        """Capture rollout manager construction arguments."""
         result = SimpleNamespace(kwargs=kwargs)
         managers.append(result)
         return result
@@ -836,6 +868,7 @@ def test_trainer_validates_supported_shared_runtime_topology(
     monkeypatch.setattr(trainer_module.dist, "get_world_size", lambda: 2)
 
     def gather(output: list[Any], value: Any) -> None:
+        """Return one matching synchronization reply per fake rank."""
         output[:] = [value, value]
 
     monkeypatch.setattr(trainer_module.dist, "all_gather_object", gather)
@@ -883,6 +916,133 @@ def test_trainer_releases_colocated_training_state_for_rollout(
     ]
 
 
+class _CPUOffloadRole(torch.nn.Module, HSDPModule):
+    """Expose real HSDP storage lifecycle with CPU-only local computation."""
+
+    def __init__(self, *, requires_grad: bool) -> None:
+        """Create one meta parameter before the test materializes its local shard."""
+        torch.nn.Module.__init__(self)
+        HSDPModule.__init__(self)
+        self.weight = torch.nn.Parameter(torch.empty(4, dtype=torch.bfloat16, device="meta"),
+                                         requires_grad=requires_grad)
+        self.forward_calls = 0
+
+    def forward(self) -> torch.Tensor:
+        """Compute a real differentiable scalar from the materialized local parameter."""
+        self.forward_calls += 1
+        return self.weight.to_local().square().sum()
+
+
+def _cpu_offload_role(
+    monkeypatch: pytest.MonkeyPatch, *, requires_grad: bool, materialized: bool = True,
+) -> tuple[_CPUOffloadRole, HSDPParamV2, HSDPStateV2]:
+    """Build actual storage/state helpers without process groups or a pin-memory backend."""
+    monkeypatch.setattr("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", lambda: 0)
+    mesh_info = object.__new__(FSDPMeshInfo)
+    mesh_info.mesh = DeviceMesh("cpu", [0, 1], mesh_dim_names=("fsdp",), _init_backend=False)
+    mesh_info.shard_mesh_dim = 0
+    mesh_info.replicate_mesh_dim = None
+    mesh_info.shard_mesh_rank = 0
+    mesh_info.shard_mesh_size = 2
+    mesh_info.shard_process_group = None
+    role = _CPUOffloadRole(requires_grad=requires_grad)
+    precision = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    parameter = HSDPParamV2(
+        role.weight, ParamModuleInfo(role, "weight", [], []), mesh_info,
+        mp_policy=precision, device=torch.device("cpu"), offload_policy=CPUOffloadPolicy(),
+    )
+    if materialized:
+        parameter.sharded_param._local_tensor = torch.tensor([3.0, 5.0], dtype=torch.bfloat16,
+                                                            requires_grad=requires_grad)
+    state = object.__new__(HSDPStateV2)
+    state.is_shard = True
+    state.module_name = "role"
+    state._reset_sharded_params = False
+    state.hsdp_params = [parameter]
+    state.offload_policy = CPUOffloadPolicy()
+    state.mp_policy = precision
+    role.hsdp_scheduler = SimpleNamespace(hsdp_state=state)
+    # Clone emulates the differentiable pinned-host allocation on a CPU-only runner.
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor.clone())
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda tensor: False)
+    return role, parameter, state
+
+
+def test_initial_rollout_release_resets_real_actor_reference_storage_before_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh shards reset before rollout without changing optimizer identity or autograd."""
+    actor, actor_parameter, actor_state = _cpu_offload_role(monkeypatch, requires_grad=True)
+    reference, reference_parameter, reference_state = _cpu_offload_role(monkeypatch, requires_grad=False)
+    original_actor = actor.weight
+    original_reference = reference.weight
+    previous_local = weakref.ref(actor.weight.to_local())
+    optimizer = torch.optim.SGD(actor.parameters(), lr=0.1)
+    trainer = object.__new__(SyncTrainer)
+    trainer.resolved_config = {"rollout": {"engine": "vllm", "vllm": {"deployment": "colocated"}}}
+    trainer.actor = SimpleNamespace(actor_model=actor)
+    trainer.reference_actor = SimpleNamespace(actor_model=reference)
+    trainer.critic = None
+    trainer.optimizer = optimizer
+    trainer._run_rank_synchronized = lambda name, callback: callback()
+    stream = SimpleNamespace(synchronize=lambda: None)
+    handle = SimpleNamespace(empty_cache=lambda: None, current_stream=lambda: stream)
+    monkeypatch.setattr(trainer_module, "hsdp_sync_stream", lambda: None)
+    monkeypatch.setattr(trainer_module.torch, "get_device_module", lambda: handle)
+
+    trainer._release_training_state_for_rollout()
+
+    assert actor.forward_calls == reference.forward_calls == 0
+    assert actor_state._reset_sharded_params and reference_state._reset_sharded_params
+    assert actor.weight is original_actor and reference.weight is original_reference
+    assert optimizer.param_groups[0]["params"][0] is original_actor
+    assert actor.weight.device.type == reference.weight.device.type == "cpu"
+    assert actor.weight.requires_grad and not reference.weight.requires_grad
+    for parameter in (actor_parameter, reference_parameter):
+        assert not parameter._sharded_param_data.is_meta
+        assert parameter._sharded_param_data.grad_fn is None
+        assert not parameter._sharded_param_data.requires_grad
+        assert parameter.reduce_dtype is torch.float32
+        torch.testing.assert_close(parameter.sharded_param.to_local(), torch.tensor([3.0, 5.0], dtype=torch.bfloat16))
+    gc.collect()
+    assert previous_local() is None
+    pointers = [parameter._sharded_param_data.data_ptr() for parameter in (actor_parameter, reference_parameter)]
+
+    trainer._release_training_state_for_rollout()
+
+    assert pointers == [
+        parameter._sharded_param_data.data_ptr() for parameter in (actor_parameter, reference_parameter)
+    ]
+    assert optimizer.param_groups[0]["params"][0] is original_actor
+    actor().backward()
+    torch.testing.assert_close(actor.weight.to_local().grad, torch.tensor([6.0, 10.0], dtype=torch.bfloat16))
+    assert reference.weight.to_local().grad is None
+    trainer._release_training_state_for_rollout()
+    torch.testing.assert_close(actor.weight.to_local().grad, torch.tensor([6.0, 10.0], dtype=torch.bfloat16))
+
+
+def test_initial_rollout_release_rejects_unmaterialized_shards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unfinished meta build fails the existing HSDP initialization validator."""
+    model, _, _ = _cpu_offload_role(monkeypatch, requires_grad=True, materialized=False)
+
+    with pytest.raises(RuntimeError, match="materialized from meta"):
+        SyncTrainer._reshard_model(model)
+
+
+def test_initial_rollout_release_retains_cpu_offload_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Already initialized offload state must reject a non-CPU shard before rollout."""
+    model, parameter, state = _cpu_offload_role(monkeypatch, requires_grad=True)
+    state._reset_sharded_params = True
+    parameter.sharded_param = SimpleNamespace(device=torch.device("cuda"))
+
+    with pytest.raises(RuntimeError, match="materialized on CPU"):
+        SyncTrainer._reshard_model(model)
+
+
 def test_trainer_builds_required_models_optimizers_and_role_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -910,6 +1070,7 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
     frozen_flags = []
 
     def build_model(unused_runtime: Any, unused_setup: Any, *, frozen: bool) -> Any:
+        """Record construction of the requested trainable or reference role."""
         del unused_runtime, unused_setup
         frozen_flags.append(frozen)
         return next(models)
@@ -925,6 +1086,7 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
     actor_calls = []
 
     def actor(**kwargs: Any) -> Any:
+        """Capture Actor construction arguments and return a role double."""
         actor_calls.append(kwargs)
         return SimpleNamespace(
             actor_model=kwargs["actor_model"],
@@ -980,7 +1142,12 @@ def test_trainer_runtime_helpers_cover_epoch_cleanup_and_synchronization(
     assert trainer.state.epoch == 1
     assert epochs == [1]
 
-    roots = [SimpleNamespace(reshard=lambda: epochs.append("reshard")) for _ in range(2)]
+    roots = [
+        SimpleNamespace(
+            reshard=lambda: epochs.append("reshard"),
+            hsdp_scheduler=SimpleNamespace(hsdp_state=SimpleNamespace(lazy_init=lambda: epochs.append("lazy-init"))),
+        ) for _ in range(2)
+    ]
     monkeypatch.setattr(trainer_module, "iter_hsdp_roots", lambda _model: roots)
     trainer._reshard_model(object())
     trainer._validate_optimizer_cpu_residency(
@@ -994,7 +1161,7 @@ def test_trainer_runtime_helpers_cover_epoch_cleanup_and_synchronization(
         ),
         "actor",
     )
-    assert epochs[-2:] == ["reshard", "reshard"]
+    assert epochs[-4:] == ["lazy-init", "reshard", "lazy-init", "reshard"]
 
     monkeypatch.setattr(trainer_module.dist, "get_world_size", lambda: 2)
     monkeypatch.setattr(
@@ -1110,25 +1277,30 @@ def _recording_checkpoints(calls):
         """Record save and restore operations without filesystem side effects."""
         @staticmethod
         def validate_resume() -> None:
+            """Record resume validation before checkpoint initialization."""
             calls.append("validate-resume")
 
         @staticmethod
         def begin(unused_state: Any) -> None:
+            """Record checkpoint initialization without restoring state."""
             del unused_state
             calls.append("checkpoint-begin")
 
         @staticmethod
         def will_save(unused_step: int) -> bool:
+            """Disable intermediate checkpoint saves in this lifecycle fixture."""
             del unused_step
             return False
 
         @staticmethod
         def complete_step(unused_state: Any, **_kwargs: Any) -> None:
+            """Record checkpoint completion for the training step."""
             del unused_state
             calls.append("checkpoint-step")
 
         @staticmethod
         def finalize(unused_state: Any) -> None:
+            """Record final checkpoint shutdown."""
             del unused_state
             calls.append("checkpoint-finalize")
     return Checkpoints()

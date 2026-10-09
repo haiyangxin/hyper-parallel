@@ -1,0 +1,191 @@
+# Qwen3.5-9B Codex recipe using Agent Lightning deployment and sampling budgets.
+# Prepare four distinct prompt IDs with --repeats 2; this is representative coverage, not a benchmark.
+# Retain HP per-call episode GRPO, native raw logprobs and the existing independent grader.
+# Eager serving protects weight publication; prefix caching awaits real post-update cache validation.
+# Observation limits retain the Codex contract, not AL's 6000-character head/tail truncation.
+model:
+  registry_name: qwen3_5_9b
+  name: qwen3_5
+  weights_path: /models/Qwen3.5-9B
+  tokenizer_path: /models/Qwen3.5-9B
+  config_overrides: null
+  attention_implementation: transformers_builtin
+  trust_remote_code: false
+  tokenizer_trust_remote_code: false
+consistency:
+  enabled: false
+data:
+  train_path: /results/tasks.parquet
+  test_path: /results/tasks.parquet
+  row_adapter: examples.code_agent.prepare_data:adapt_row
+  max_prompt_length: 65536
+  max_train_samples: 4
+  shuffle: false
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: true
+rollout:
+  engine: vllm
+  num_return_sequences: 8
+  max_new_tokens: 12288
+  ignore_eos: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  seed: 20261009
+  vllm:
+    deployment: colocated
+    data_parallel_size: 4
+    port: 18970
+    model_implementation: native
+    tensor_parallel_size: 1
+    weight_sync:
+      strategy: full_gather
+      bucket_size_mb: 128
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: true
+    batch_invariant: false
+    enable_prefix_caching: false
+    enable_chunked_prefill: true
+    enable_auto_tool_choice: true
+    tool_call_parser: qwen3_coder
+    gpu_memory_utilization: 0.8
+    max_model_len: 81920
+    block_size: 128
+    max_num_seqs: 2
+    max_num_batched_tokens: 8192
+    logprobs_mode: raw_logprobs
+    startup_timeout: 600
+    request_timeout: 1800
+agentic:
+  runner: codex
+  interaction_mode: multi_turn
+  protocol: json_function_call
+  apply_chat_template: true
+  max_turns: 100
+  max_observation_tokens: 0
+  max_episode_tokens: 81920
+  codex:
+    executable: codex
+    version: 0.152.1
+    model: qwen3_5_9b
+    model_context_window: 69632
+    reasoning_effort: none
+    sandbox: danger-full-access
+    gateway_host: 127.0.0.1
+    gateway_public_host: 127.0.0.1
+    gateway_port: 18980
+    max_inflight_requests: 4
+    timeout_seconds: 5400
+    request_timeout: 1800
+    session_root: /results/sessions
+    task_factory: examples.code_agent.task:build_task
+    task_config:
+      run_timeout: 5
+    workspace:
+      image: sha256:12c0ec8f5b1a8024b415ecab27f26e9bb4d0d5434b175cd9ea8cfb5744d2c6da
+      max_concurrent: 4
+      output_limit_bytes: 4194304
+    max_request_bytes: 8388608
+    max_response_bytes: 67108864
+    model_instructions: |-
+      You repair a Python repository in /workspace.
+      Use exec_command with login=false. Use write_stdin only with a returned session ID.
+      Read the relevant files, edit only src/*.py, and run python public_test.py.
+      For patches, run python /opt/hyper-codex-home/checked_patch.py with a shell heredoc
+      containing a Codex *** Begin Patch / *** End Patch block. Check its exit status and diff.
+      Before patching, read the actual file and exact lines to change. For an existing file,
+      use the complete format below. PATH, OLD and NEW are placeholders: replace them with
+      the real allowed file and its exact text before executing.
+      python /opt/hyper-codex-home/checked_patch.py <<'PATCH'
+      *** Begin Patch
+      *** Update File: PATH
+      @@
+      -OLD
+      +NEW
+      *** End Patch
+      PATCH
+      The "*** Update File: " header and "@@" are required. A bare path or "*** PATH" is invalid.
+      If a patch is rejected, read its feedback, reread the relevant file, and change its header
+      or context. Never repeat the same failed command unchanged. Check the real exit status,
+      changed-file hashes and diff, then run the task's tests.
+      Preserve protected files. Use /tmp for temporary inputs. If a command fails, revise it.
+      After testing, return a concise summary of the actual result. Do not ask questions.
+    instruction_template: '{prompt}'
+evaluation:
+  enabled: true
+  batch_size: 1
+  max_samples: 4
+  max_new_tokens: 12288
+  temperature: 0.7
+  top_p: 1.0
+  top_k: 0
+  do_sample: true
+  log_samples: 2
+  progress_steps: 0
+algorithm:
+  name: grpo
+  advantage_epsilon: 1.0e-06
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.28
+  clip_ratio_c: 3.0
+  kl_coef: 0.0
+  kl_type: low_var_kl
+  loss_aggregation: token-mean
+train:
+  max_steps: 2
+  seed: 1234
+  prompt_batch_size: 1
+  micro_batch_size: 1
+  response_mini_batch_size: 1
+  policy_update_epochs: 1
+  init_device: meta
+  comm_backend: hccl
+  learning_gate:
+    enabled: false
+    min_gradient_norm: 0.0
+    require_mixed_rewards: false
+  accelerator:
+    dp_replicate: 1
+    dp_shard: 4
+    tp: 1
+    cp: 1
+    pp: 1
+    reshard_after_forward: true
+    comm_fusion: false
+    cpu_offload: true
+    activation_checkpoint: full
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: null
+  optimizer:
+    lr: 1.0e-06
+    lr_min: 0.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    eps: 1.0e-08
+    betas:
+    - 0.9
+    - 0.999
+    foreach: null
+  checkpoint:
+    output_dir: /results/checkpoints
+    save_steps: 0
+    save_final: true
+    verify_reload: false
+logging:
+  backends:
+  - console
+  project_name: hyper-rl
+  experiment_name: qwen3_5_9b_code_agent
+  log_steps: 1
+  log_samples: 2
+  wandb:
+    mode: disabled
+    entity: null
+    directory: /results/wandb

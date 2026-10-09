@@ -1032,6 +1032,8 @@ class VLLMGenerationEngine:
                     ),
                 )
             )
+        if self._rollout_model.family == "qwen3_5":
+            command.append("--language-model-only")
         for key, default in (
             ("trust_remote_code", True),
             ("enable_expert_parallel", False),

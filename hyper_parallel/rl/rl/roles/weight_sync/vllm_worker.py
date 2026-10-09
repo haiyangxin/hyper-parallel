@@ -15,21 +15,25 @@
 """vLLM worker hooks used by Actor-to-rollout weight synchronization."""
 import asyncio
 import base64
+import json
 import os
 import pickle
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 # Installed worker hooks share RL-owned version state on foreign vLLM worker instances.
 # vLLM has no public policy-version API for these transaction fields.
 # pylint: disable=protected-access
 import torch
+from safetensors import safe_open
 
 from rl.roles.model_setup import (
     HYPER_QWEN3_ARCHITECTURE,
     NATIVE_QWEN3_ARCHITECTURE,
     NATIVE_QWEN3_MOE_ARCHITECTURE,
+    NATIVE_QWEN3_5_ARCHITECTURE,
 )
 from rl.roles.weight_sync.model_adapter import rollout_tensor_descriptions
 from rl.roles.weight_sync.packed_weight import unpack_packed_weights
@@ -40,6 +44,7 @@ _SUPPORTED_ARCHITECTURES = frozenset(
         HYPER_QWEN3_ARCHITECTURE,
         NATIVE_QWEN3_ARCHITECTURE,
         NATIVE_QWEN3_MOE_ARCHITECTURE,
+        NATIVE_QWEN3_5_ARCHITECTURE,
     )
 )
 
@@ -157,6 +162,8 @@ def get_direct_reshard_layout(worker: Any) -> dict[str, Any]:
         raise RuntimeError("vLLM model runner is not initialized")
     if not _is_supported_worker(worker):
         raise ValueError("Direct reshard requires a supported Qwen3 rollout model")
+    if NATIVE_QWEN3_5_ARCHITECTURE in _worker_architectures(worker):
+        raise ValueError("Qwen3.5/Qwen3.8 supports full_gather only")
     topology = _rollout_worker_topology(worker)
     model = worker.model_runner.get_model()
     return {
@@ -561,6 +568,9 @@ def _load_packed_weights(
     if NATIVE_QWEN3_MOE_ARCHITECTURE in _worker_architectures(worker):
         _load_moe_checkpoint_weights(worker, model, weights)
         return
+    if NATIVE_QWEN3_5_ARCHITECTURE in _worker_architectures(worker):
+        _load_qwen3_5_checkpoint_weights(worker, model, weights)
+        return
     if _is_hyper_worker(worker):
         loaded = model.load_weights(weights, require_all=False)
     else:
@@ -569,6 +579,42 @@ def _load_packed_weights(
         raise RuntimeError(
             "vLLM load_weights did not accept any parameter from a packed bucket"
         )
+
+
+def _qwen3_5_text_checkpoint_names(worker: Any) -> set[str]:
+    """Read the checkpoint's text policy keys without loading weight tensors."""
+    checkpoint = Path(worker.model_config.model)
+    index_path = checkpoint / "model.safetensors.index.json"
+    if index_path.is_file():
+        names = set(json.loads(index_path.read_text(encoding="utf-8"))["weight_map"])
+    else:
+        with safe_open(str(checkpoint / "model.safetensors"), framework="pt", device="cpu") as weights:
+            names = set(weights.keys())
+    text_names = {name for name in names if name.startswith("model.language_model.")}
+    if not text_names:
+        raise ValueError("Qwen3.5 checkpoint contains no text policy parameters")
+    if not worker.model_config.hf_text_config.tie_word_embeddings:
+        if "lm_head.weight" not in names:
+            raise ValueError("Qwen3.5 checkpoint is missing lm_head.weight")
+        text_names.add("lm_head.weight")
+    return text_names
+
+
+def _load_qwen3_5_checkpoint_weights(worker: Any, model: Any, weights: list[tuple[str, Any]]) -> None:
+    """Publish only complete text policies through the native fused-weight loader."""
+    if not getattr(worker, "_hyper_expected_weights", set()):
+        worker._hyper_expected_weights = _qwen3_5_text_checkpoint_names(worker)
+        worker._hyper_received_weights = set()
+    for name, weight in weights:
+        if name not in worker._hyper_expected_weights:
+            raise ValueError(f"Unexpected Qwen3.5 text policy weight {name!r}")
+        if name in worker._hyper_received_weights:
+            raise ValueError(f"Duplicate Qwen3.5 text policy weight {name!r}")
+        # A native fused loader may retain an input until another projection arrives.
+        # The IPC producer can release its bucket as soon as this RPC acknowledges.
+        if not model.load_weights([(name, weight.clone())]):
+            raise RuntimeError(f"Native Qwen3.5 loader did not accept weight {name!r}")
+        worker._hyper_received_weights.add(name)
 
 
 def _load_moe_checkpoint_weights(worker: Any, model: Any, weights: list[tuple[str, Any]]) -> None:
@@ -713,6 +759,11 @@ def _finish_custom_weight_update(worker: Any) -> None:
         )
     if getattr(worker, "_hyper_layerwise_reload", False):
         _finalize_moe_checkpoint_reload(worker)
+    if NATIVE_QWEN3_5_ARCHITECTURE in _worker_architectures(worker):
+        expected = getattr(worker, "_hyper_expected_weights", set())
+        missing = expected - getattr(worker, "_hyper_received_weights", set())
+        if not expected or missing:
+            raise RuntimeError(f"Qwen3.5 text policy update is incomplete: missing={sorted(missing)}")
     worker._weight_update_active = False  # pylint: disable=W0212
     worker._is_checkpoint_format = True  # pylint: disable=W0212
     worker._hyper_loaded_policy_version = pending_version

@@ -50,6 +50,7 @@ def test_consistency_profile_installs_shared_recipe_idempotently(
         """Record Transformers attention registrations without global mutation."""
 
         def register(self, name: str, value: Any) -> None:
+            """Store one attention implementation in the test registry."""
             self[name] = value
 
     runtime = profile_module._runtime  # pylint: disable=protected-access
@@ -155,6 +156,7 @@ def test_consistency_gate_accepts_right_padded_bit_exact_logprobs(
     )
 
     def all_gather(output: list[Any], value: Any, group: Any) -> None:
+        """Gather matching rank evidence in the simulated DP group."""
         assert group == "dp"
         output[0] = value
         output[1] = value.copy() if isinstance(value, dict) else value
@@ -195,9 +197,11 @@ def test_partial_prefill_rng_restores_discarded_request_offsets() -> None:
             self.offset = 0
 
         def get_offset(self) -> int:
+            """Return the seeded generator's current offset."""
             return self.offset
 
         def set_offset(self, offset: int) -> None:
+            """Restore the seeded generator's saved offset."""
             self.offset = offset
 
     class FakeModelRunner:
@@ -321,6 +325,7 @@ def test_consistency_attention_executes_standard_and_packed_kernels(
     calls: list[tuple[str, tuple[int, ...], dict[str, Any]]] = []
 
     def dense(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Record the dense attention kernel's input contract."""
         assert key.shape == value.shape == query.shape
         calls.append(("dense", tuple(query.shape), kwargs))
         return query
@@ -332,6 +337,7 @@ def test_consistency_attention_executes_standard_and_packed_kernels(
         *_args: Any,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Record the packed attention kernel's input contract."""
         assert key.shape == value.shape == query.shape
         calls.append(("varlen", tuple(query.shape), kwargs))
         return query
@@ -387,6 +393,7 @@ def test_batch_invariant_reduction_and_rmsnorm_preserve_values(
         *,
         epsilon: float,
     ) -> tuple[torch.Tensor, None]:
+        """Record the fused RMSNorm dtype and epsilon contract."""
         rms_calls.append((hidden_states.dtype, epsilon))
         return hidden_states + weight, None
 
@@ -417,7 +424,7 @@ def test_consistency_installs_sum_rmsnorm_and_validates_rollout_dependencies(
     runtime = profile_module._runtime  # pylint: disable=protected-access
     monkeypatch.setattr(runtime, "batch_invariant_sum_compatibility_installed", False)
     monkeypatch.setattr(runtime, "npu_rms_norm", None)
-    original_calls = []
+    registrations = []
 
     class DeviceTensor:
         """Expose NPU device metadata over a CPU tensor for interface tests."""
@@ -427,10 +434,24 @@ def test_consistency_installs_sum_rmsnorm_and_validates_rollout_dependencies(
             self.value = value
 
         def dim(self) -> int:
+            """Return the wrapped tensor's dimension count."""
             return self.value.dim()
 
         def movedim(self, source: int, destination: int) -> torch.Tensor:
+            """Move one axis of the wrapped tensor."""
             return self.value.movedim(source, destination)
+
+        def is_floating_point(self) -> bool:
+            """Return whether the wrapped tensor has a floating dtype."""
+            return self.value.is_floating_point()
+
+        def numel(self) -> int:
+            """Return the wrapped tensor's element count."""
+            return self.value.numel()
+
+        def reshape(self, *shape: Any) -> torch.Tensor:
+            """Reshape the wrapped tensor without changing its values."""
+            return self.value.reshape(*shape)
 
     operations = SimpleNamespace(
         npu_reduce_sum_batch_invariant=lambda tensor, dim, keepdim: tensor.sum(
@@ -438,12 +459,11 @@ def test_consistency_installs_sum_rmsnorm_and_validates_rollout_dependencies(
         )
     )
 
-    def original_reduce_sum(tensor: Any, dim: Any = None, keepdim: bool = False) -> Any:
-        original_calls.append((dim, keepdim))
-        return tensor.sum(dim=dim, keepdim=keepdim)
-
     batch_module = SimpleNamespace(
-        reduce_sum=original_reduce_sum,
+        torch_sum=torch.sum,
+        _batch_invariant_LIB=SimpleNamespace(
+            impl=lambda *args, **kwargs: registrations.append((args, kwargs)),
+        ),
         torch=SimpleNamespace(
             ops=SimpleNamespace(batch_invariant_ops=operations),
             sum=torch.sum,
@@ -466,6 +486,7 @@ def test_consistency_installs_sum_rmsnorm_and_validates_rollout_dependencies(
         *,
         epsilon: float,
     ) -> Any:
+        """Represent the fused RMSNorm dependency in the installer test."""
         return (hidden * weight + epsilon,)
 
     monkeypatch.setitem(
@@ -492,6 +513,11 @@ def test_consistency_installs_sum_rmsnorm_and_validates_rollout_dependencies(
         keepdim=True,
     )
     cpu_reduced = batch_module.reduce_sum(torch.ones((2, 3)), dim=-1)
+    npu_reduced_all = batch_module.reduce_sum(DeviceTensor(torch.arange(6.0).reshape(2, 3)))
+    default_sum = registrations[0][0][1]
+    tensor_reduced_all = default_sum(torch.arange(6.0).reshape(2, 3))
+    bool_reduced_all = default_sum(torch.tensor([True, False, True]))
+    typed_reduced_all = default_sum(torch.arange(6).reshape(2, 3), dtype=torch.float32)
     profile_module._install_qwen3_npu_rms_norm()  # pylint: disable=protected-access
     rms_module = SimpleNamespace(
         weight=torch.tensor([2.0, 3.0]),
@@ -507,7 +533,13 @@ def test_consistency_installs_sum_rmsnorm_and_validates_rollout_dependencies(
     torch.testing.assert_close(reduced, torch.tensor([[3.0, 5.0, 7.0]]))
     torch.testing.assert_close(cpu_reduced, torch.tensor([3.0, 3.0]))
     torch.testing.assert_close(rms_output, torch.tensor([[2.5, 6.5]]))
-    assert original_calls == [(-1, False)]
+    torch.testing.assert_close(npu_reduced_all, torch.tensor(15.0))
+    torch.testing.assert_close(tensor_reduced_all, torch.tensor(15.0))
+    torch.testing.assert_close(bool_reduced_all, torch.tensor(2, dtype=torch.int64))
+    torch.testing.assert_close(typed_reduced_all, torch.tensor(15.0))
+    assert registrations[0][0][0] == "aten::sum"
+    assert registrations[0][0][2] == "NPU"
+    assert registrations[0][1] == {"allow_override": True}
     assert runtime.batch_invariant_sum_compatibility_installed
     assert runtime.npu_rms_norm is npu_rms_norm
 
@@ -530,6 +562,7 @@ def test_consistency_post_update_diagnostic_counts_changed_action_tokens(
     actor_log_probs[0, 1] += 0.01
 
     def gather(output: list[Any], value: Any, group: Any) -> None:
+        """Gather matching diagnostic counts in the simulated DP group."""
         assert group == "dp"
         output[:] = [value, value]
 
@@ -561,7 +594,7 @@ def test_consistency_validates_model_identity_versions_and_installs_rng_fix(
         text_model_type="qwen3",
     )
     profile_module.validate_consistency_model_identity(config, registration)
-    versions = dict(profile_module._EXPECTED_PACKAGE_VERSIONS)  # pylint: disable=protected-access
+    versions = {**profile_module._NUMERICAL_PACKAGE_VERSIONS, "vllm": "0.22.1", "vllm-ascend": "0.22.1rc1"}
     monkeypatch.setattr(
         profile_module,
         "package_version",

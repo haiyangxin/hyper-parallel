@@ -1,11 +1,11 @@
 # 仓库 Code Agent：工作区与独立判题
 
-已完成两卡 Qwen3-4B 的仓库 Agent RL 两步功能闭环：真实调用、冻结判题、训练消费、权重发布、评估和保存。
-训练奖励全零，未观察到有效任务学习；同任务短评估为 1/2，不代表泛化或训练收益。SWE-bench 两例官方正反例与两卡两步功能训练已通过；训练及最终评估均为零分，未观察到修复或学习。
-后续接口和阶段边界见[开发文档](../../docs/code_agent_development.md)。
-
-2026-09-28 新增的外部 API 仅推理路径已用 Qwen3.8-27B 通过两可控仓库及两 SWE 实例；
-该结果与上述历史训练分开记录，详见[当前分支验收](../../docs/code_agent_handoff.md#外部-api-仅推理验收2026-09-28)。
+Qwen3-4B 与 Qwen3.5-9B 已完成可控仓库及两个固定 SWE 实例的 RL 功能闭环。
+9B 两步训练、全参数发布、最终评估、保存及新容器恢复通过，最近短预算任务奖励全零，
+未观察到修复或有效学习。Qwen3.8 的基础 RL、仓库推理修复及最小训练闭环通过，
+完整在线 Code Agent 训练仍受 NPU OOM 阻塞。
+接口见[开发说明](../../docs/code_agent_development.md)，预算、数值失败及未运行项见
+[当前状态](../../docs/code_agent_handoff.md)。历史实验输出和生成权重已清理，重跑须重新生成数据与 registry。
 
 ## 数据与奖励
 
@@ -14,6 +14,11 @@
 `prepare_data.py` 生成两行功能数据，使用既有 `PromptRecord`、`data.row_adapter` 合同；
 prompt 只含公开任务，ground truth 仅含 fixture ID、基线 hash 和测试版本 hash。
 该小数据集只用于功能验证，不是 benchmark 或独立评估集。
+
+四卡 Qwen3.8 功能配方需要 `prepare_data.py --repeats 2`，生成四条有独立采样身份的记录。
+默认仍生成原来的两条；新增 `replica_index` 仅区分重复采样，任务 ID、公开问题和私有测试身份保持不变。
+训练 sampler 会丢弃不能被训练 DP 大小整除的尾部，两条数据在四卡下没有可用训练行。
+重复题目用于分布式功能覆盖，不能按四道独立题报告修复率或学习收益。
 
 `RepositoryTask.prepare(workspace)` 复制构造时固定的公开基线字节。
 候选可增改删 `src/*.py`；其余基线文件受保护，额外非源码文件也拒绝。
@@ -290,6 +295,42 @@ python hyper_parallel/rl/tests/trial/_repository_program.py \
 它只验证调用接线、奖励/episode 归属和原样映射，不证明真实模型 token 一致性、自主修复或 RL 学习效果。
 
 ## 真实训练功能验收
+
+Qwen3.5-9B 提供[可控仓库配方](configs/qwen3_5_9b_code_agent.yaml)和
+[固定 SWE 配方](configs/qwen3_5_9b_swebench.yaml)，复用公共 `qwen3_5` 文本 Actor，保留 Codex
+CLI 与独立 grader。模型部署和训练参数参照 Agent Lightning 的 SWE-smith 示例：四卡、推理
+TP1/DP4、81920 服务上下文、12288 单次输出上限、100 次模型调用、关闭 thinking、训练温度 1、
+评估温度 0.7、学习率 `1e-6`、clip 0.2/0.28、CPU offload 和完整激活重算。
+Codex 上下文窗口为 69632，为单次输出预留空间；`reasoning_effort: none` 经现有协议转换为
+`chat_template_kwargs.enable_thinking=false`，实际请求仍须真机核对。
+
+后续新建运行使用修订后的 9B 系统提示：先读取真实文件上下文，再按完整 heredoc 骨架提交
+`*** Update File: PATH`、`@@` 与逐行变更；示例占位符须替换，不提供解题代码。
+被拒绝的命令必须根据反馈修正，禁止原样重复；工具协议、任务、评分和正式配方预算保持原合同。
+
+这里保留 Hyper-RL 的逐调用 episode GRPO、token-mean、真实采样 old logprob、严格基础设施
+失败传播和原 grader。Agent Lightning 的 Mini-SWE-Agent bash 提示、自定义 Hermes 模板、
+按 rollout 归一化损失、Actor 重算 old logprob、长度惩罚与失败补零不移植；6000 字符观察裁剪
+也不等同于当前 Codex 的工具输出约束。Ascend 权重发布使用已支持的 eager、官方模板及
+`qwen3_coder` parser、`full_gather`；prefix cache 默认关闭，更新后的缓存正确性须独立验证。
+不要求部署其 Kubernetes/VERL 框架。
+
+为避免长调用生成完整词表的终端矩阵，`models/qwen3_5/adapter/selected_log_probs.py` 为文本
+Actor 和 Reference 提供分块输出模式。每次最多投影 512 个 token 行，训练时重算 head，
+返回完整 FP32 `[batch, length - 1]` 下一 token logprob；所有 prompt、动作和 padding 位置保留，
+损失仍使用原掩码。普通 HF forward 和参数身份保持不变，Qwen3 bit-exact 路径保持优先。
+该模式要求 root `reshard_after_forward=false`、head 无独立分片边界，防止不同 rank 的分块
+次数引入不同数量的集体通信。CPU 的概率、完整梯度和重算检查已通过；四卡实际
+14349 token 全宽反向及完整功能闭环也通过。BF16 小模型局部梯度门限仍失败：
+相对 L2 为 0.0625，超过 0.05，绝对差约 2.24e-8；功能通过不替代该数值门禁。
+更长轨迹尚未完成验证，不能凭服务上下文配置推断训练容量。
+
+配方使用四个独立 prompt ID、每组八个采样，共 32 个 episode；不同于参考示例的
+16 个 prompt × 8。功能验收可显式覆盖为每组两个采样，共八个 episode，保留完整两步更新、
+实际策略版本、评分、最终评估与保存检查。训练和评估重复功能任务不代表独立基准性能。
+9B 已完成的短预算实验采用每会话八次调用；可控任务两步、保存及同拓扑恢复续训通过，
+SWE 两步训练 16 例和最终评估 4 例均为零奖励。24 次预算探测因中断及 OOM 未形成完整会话，
+更长训练容量和有效学习仍待验证；状态见[交接记录](../../docs/code_agent_handoff.md)。
 
 已验证的入口为 [Qwen3-4B 配方](configs/qwen3_4b_code_agent.yaml)：16 次调用预算、16K 上下文、2K 输出，
 使用精简的可选 Codex 系统提示并关闭 thinking；默认 CLI 提示不受影响。

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Prepare two public repository tasks with opaque grading identity hashes."""
+"""Prepare public toy repository tasks with opaque grading identity hashes."""
 
 import argparse
 from pathlib import Path
@@ -34,20 +34,41 @@ def adapt_row(row: Mapping[str, Any], index: int) -> PromptRecord:
     task_id = f"repository-v1:{manifest['fixture_id']}"
     if row.get("task_id") != task_id:
         raise ValueError("Repository task identity differs from its fixture")
-    return PromptRecord(task_id, tuple(Message(item["role"], item["content"]) for item in row["prompt"]),
-                        dict(manifest), {"task_type": "repository_python_cli", "task_id": task_id})
+    prompt_id = task_id
+    metadata = {"task_type": "repository_python_cli", "task_id": task_id}
+    if "replica_index" in row:
+        replica_index = row["replica_index"]
+        if isinstance(replica_index, bool) or not isinstance(replica_index, int) or replica_index < 0:
+            raise ValueError("Repository replica_index must be a non-negative integer")
+        if replica_index > 0:
+            prompt_id = f"{task_id}:replica:{replica_index}"
+            metadata["replica_index"] = replica_index
+    return PromptRecord(prompt_id, tuple(Message(item["role"], item["content"]) for item in row["prompt"]),
+                        dict(manifest), metadata)
 
 
-def prepare_data(output: Path) -> None:
-    """Write functional toy tasks; this overlapping two-row set is not a benchmark."""
+def prepare_data(output: Path, *, repeats: int = 1) -> None:
+    """Write toy tasks with optional distinct sampling identities for repeated fixtures.
+
+    Args:
+        output: Destination parquet file.
+        repeats: Number of copies per fixture. Repeated tasks provide distributed
+            functional coverage, not independent evaluation or a benchmark.
+    """
+    if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats <= 0:
+        raise ValueError("Repository repeats must be a positive integer")
     rows = []
-    for fixture_id in ("merge_intervals", "word_counts"):
-        fixture, _ = load_fixture(fixture_id)
-        rows.append({"task_id": f"repository-v1:{fixture_id}", "ground_truth": task_manifest(fixture_id),
-                     "prompt": [{"role": "user", "content": (
-                         "Fix the Python repository in /workspace. Read its files, modify source code, and run "
-                         "python public_test.py before finishing. Preserve protected files. "
-                         + fixture["description"])}]})
+    for replica_index in range(repeats):
+        for fixture_id in ("merge_intervals", "word_counts"):
+            fixture, _ = load_fixture(fixture_id)
+            row = {"task_id": f"repository-v1:{fixture_id}", "ground_truth": task_manifest(fixture_id),
+                   "prompt": [{"role": "user", "content": (
+                       "Fix the Python repository in /workspace. Read its files, modify source code, and run "
+                       "python public_test.py before finishing. Preserve protected files. "
+                       + fixture["description"])}]}
+            if repeats > 1:
+                row["replica_index"] = replica_index
+            rows.append(row)
     output.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(rows), output)
 
@@ -56,7 +77,9 @@ def main() -> None:
     """Write the prepared toy task parquet file."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    prepare_data(parser.parse_args().output)
+    parser.add_argument("--repeats", type=int, default=1, help="Copies per toy fixture for distributed functional runs")
+    args = parser.parse_args()
+    prepare_data(args.output, repeats=args.repeats)
 
 
 if __name__ == "__main__":

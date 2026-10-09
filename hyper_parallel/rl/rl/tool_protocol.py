@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Read-only Hermes evidence and fail-closed rollout attribution."""
+"""Read-only tool parser evidence and fail-closed rollout attribution."""
 
 from contextvars import ContextVar
 from functools import wraps
+import inspect
 import json
 import re
 from typing import Any, Iterable, Mapping
 
+from rl.tool_xml import inspect_xml_calls
 
 _CAPTURE = ContextVar("hyper_tool_protocol", default=None)
 _BLOCK = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.DOTALL)
@@ -80,13 +82,26 @@ def inspect_tool_response(response: dict) -> dict:
         if message.get("tool_calls"):
             return {"failure_origin": "unknown", "failure_reason": "missing_raw_tool_call", "trainable": False}
         return result
-    calls, error = _raw_calls(blocks)
+    source = item.get("source")
+    xml_format = source == "Qwen3CoderToolParser.extract_tool_calls"
+    if xml_format:
+        if item.get("parser_format") != "qwen3_xml":
+            return {"failure_origin": "unknown", "failure_reason": "unsupported_parser_format", "trainable": False}
+        calls, error = inspect_xml_calls(item["parser_input"], item.get("request_tools"))
+    elif source not in (None, "Hermes2ProToolParser.extract_tool_calls"):
+        return {"failure_origin": "unknown", "failure_reason": "unsupported_parser_source", "trainable": False}
+    elif any(block.lstrip().startswith("<function=") for block in blocks):
+        return {"failure_origin": "infrastructure", "failure_reason": "parser_format_mismatch", "trainable": False}
+    else:
+        calls, error = _raw_calls(blocks)
     if error is not None:
         return error
     parsed_result = item.get("parser_result")
     if not isinstance(parsed_result, dict):
         return {"failure_origin": "unknown", "failure_reason": "missing_parser_result", "trainable": False}
-    if _parsed_calls(message.get("tool_calls")) != calls or _parsed_calls(parsed_result.get("tool_calls")) != calls:
+    parsed_message = _parsed_calls(message.get("tool_calls"))
+    captured_calls = _parsed_calls(parsed_result.get("tool_calls"))
+    if not _calls_equal(parsed_message, calls, xml_format) or not _calls_equal(captured_calls, calls, xml_format):
         result.update(failure_origin="infrastructure", failure_reason="parser_result_mismatch", trainable=False)
     return result
 
@@ -143,6 +158,50 @@ def _parsed_calls(parsed: Any) -> list:
         return []
 
 
+def _calls_equal(parsed: list, expected: list, typed: bool) -> bool:
+    """Retain XML argument type identity rather than accepting Python bool/int equality."""
+    if not typed:
+        return parsed == expected
+    try:
+        parsed_json = json.dumps(parsed, sort_keys=True, allow_nan=False)
+        return parsed_json == json.dumps(expected, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+
+
+def _tool_parser_capture(parser_cls: type, source: str, *, xml_format: bool = False) -> Any:
+    """Build one instrumented delegate with its original parser and schema provenance."""
+    original = parser_cls.extract_tool_calls
+
+    @wraps(original)
+    def capture_parser(self: Any, model_output: str, request: Any) -> Any:
+        """Record input/result without replacing sampled tokens or parser output."""
+        original_tools = None
+        context = _CAPTURE.get()
+        if xml_format and context is not None and request is context["request"]:
+            tools = getattr(request, "tools", None)
+            if isinstance(tools, list):
+                try:
+                    original_tools = json.loads(json.dumps([
+                        tool.model_dump(mode="json") if hasattr(tool, "model_dump") else tool for tool in tools
+                    ], allow_nan=False))
+                except (TypeError, ValueError):
+                    pass
+        result = original(self, model_output, request)
+        capture = _CAPTURE.get()
+        if capture is not None:
+            evidence = {"invalid": "cross_request_tool_capture"}
+            if request is capture["request"]:
+                evidence = {"parser_input": model_output, "parser_result": result.model_dump(), "source": source}
+                if xml_format:
+                    evidence["parser_format"] = "qwen3_xml"
+                    evidence["request_tools"] = original_tools
+            capture["tools"].append(evidence)
+        return result
+
+    return capture_parser
+
+
 def install_tool_evidence() -> None:
     """Instrument the pinned vLLM non-streaming path without changing its output tokens."""
     # Optional server dependency: this module is also used by CPU-only training code.
@@ -153,21 +212,19 @@ def install_tool_evidence() -> None:
     original = OpenAIServingChat.chat_completion_full_generator
     if getattr(original, "hyper_tool_evidence", False):
         return
-    parse = Hermes2ProToolParser.extract_tool_calls
+    generator_signature = inspect.signature(original)
+    if "parser" in generator_signature.parameters:
+        parser_parameter = "parser"
+    elif "reasoning_parser" in generator_signature.parameters:
+        parser_parameter = "reasoning_parser"
+    else:
+        raise ValueError("vLLM full-generator interface has no supported parser parameter")
+    parsers = [(Hermes2ProToolParser, False, "Hermes2ProToolParser.extract_tool_calls")]
+    if parser_parameter == "parser":
+        # Qwen3Coder is a reviewed 0.23 delegate; legacy 0.22 Hermes behavior stays unchanged.
+        from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser  # pylint: disable=C0415
+        parsers.append((Qwen3CoderToolParser, True, "Qwen3CoderToolParser.extract_tool_calls"))
     extract_reasoning = Qwen3ReasoningParser.extract_reasoning
-
-    @wraps(parse)
-    def capture_parser(self: Any, model_output: str, request: Any) -> Any:
-        """Record Hermes input/result without replacing sampled tokens or parser output."""
-        result = parse(self, model_output, request)
-        capture = _CAPTURE.get()
-        if capture is not None:
-            evidence = {"invalid": "cross_request_tool_capture"}
-            if request is capture["request"]:
-                evidence = {"parser_input": model_output, "parser_result": result.model_dump(),
-                            "source": "Hermes2ProToolParser.extract_tool_calls"}
-            capture["tools"].append(evidence)
-        return result
 
     @wraps(extract_reasoning)
     def capture_reasoning(self: Any, model_output: str, request: Any) -> Any:
@@ -185,8 +242,13 @@ def install_tool_evidence() -> None:
     @wraps(original)
     async def capture_response(self: Any, request: Any, result_generator: Any, request_id: str, model_name: str,
                                conversation: Any, tokenizer: Any, request_metadata: Any,
-                               reasoning_parser: Any = None) -> Any:
+                               *parser_args: Any, **parser_kwargs: Any) -> Any:
         """Attach one-call evidence only when both engine output and parser capture are unambiguous."""
+        bound = generator_signature.bind(self, request, result_generator, request_id, model_name,
+                                         conversation, tokenizer, request_metadata, *parser_args, **parser_kwargs)
+        selected_parser = bound.arguments.get(parser_parameter)
+        reasoning_parser = (getattr(selected_parser, "reasoning_parser", None)
+                            if parser_parameter == "parser" else selected_parser)
         capture = []
         reasoning_capture = []
         outputs = []
@@ -201,7 +263,7 @@ def install_tool_evidence() -> None:
         token = _CAPTURE.set(context if request.return_token_ids else None)
         try:
             response = await original(self, request, observe(), request_id, model_name,
-                                      conversation, tokenizer, request_metadata, reasoning_parser)
+                                      conversation, tokenizer, request_metadata, *parser_args, **parser_kwargs)
             if capture and len(outputs) == len(capture) == 1:
                 output = outputs[0]
                 capture[0].update(
@@ -219,6 +281,7 @@ def install_tool_evidence() -> None:
             _CAPTURE.reset(token)
 
     capture_response.hyper_tool_evidence = True
-    Hermes2ProToolParser.extract_tool_calls = capture_parser
+    for parser_cls, xml_format, source in parsers:
+        parser_cls.extract_tool_calls = _tool_parser_capture(parser_cls, source, xml_format=xml_format)
     Qwen3ReasoningParser.extract_reasoning = capture_reasoning
     OpenAIServingChat.chat_completion_full_generator = capture_response

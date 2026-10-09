@@ -18,12 +18,14 @@ import json
 import logging
 import os
 import pickle
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import torch
 import torch.distributed as dist
 import yaml
+from transformers import AutoConfig
 
 from rl.utils.monitoring.config import sanitize_config
 from hyper_parallel import SkipDTensorDispatch
@@ -296,6 +298,22 @@ class RLCheckpointManager:
         def export() -> None:
             """All ranks gather; only the writing rank saves tokenizer files."""
             model_config = self.trainer.model.config
+            registration = self.trainer.model_registration
+            export_config = model_config
+            actor_architecture = registration.hf_architecture
+            if getattr(registration, "family", None) == "qwen3_5":
+                # Text Actor weights revert to the original conditional namespace.
+                # Its outer HF configuration must keep the matching model identity.
+                export_config = AutoConfig.from_pretrained(
+                    registration.weights_path, local_files_only=True, trust_remote_code=False,
+                )
+                if model_config.model_type != registration.text_model_type:
+                    raise ValueError("Qwen3.5 Actor configuration must describe the checkpoint text model")
+                if export_config.model_type != registration.model_type:
+                    raise ValueError("Qwen3.5 export configuration must retain the checkpoint model type")
+                actor_architecture = "Qwen3_5ForCausalLM"
+                export_config.text_config = deepcopy(model_config)
+                export_config.text_config.architectures = [actor_architecture]
             try:
                 wrote_weights = CheckpointManager(self.trainer.model).save_pretrained(
                     export_dir,
@@ -304,9 +322,10 @@ class RLCheckpointManager:
             finally:
                 # Transformers serializes the dynamic HSDP class name; inference
                 # loaders need the original architecture registered for this model.
-                model_config.architectures = [self.trainer.model_registration.hf_architecture]
+                model_config.architectures = [actor_architecture]
             if wrote_weights:
-                model_config.save_pretrained(export_dir)
+                export_config.architectures = [registration.hf_architecture]
+                export_config.save_pretrained(export_dir)
                 self.trainer.tokenizer.save_pretrained(str(export_dir))
 
         self.run_synchronized("checkpoint HF export", export)

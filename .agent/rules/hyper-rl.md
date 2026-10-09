@@ -37,6 +37,13 @@ Load the affected product contract rather than every RL document.
   [MoE recipe](../../hyper_parallel/rl/examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_vllm.yaml) and
   [MoE validation scope](../../hyper_parallel/rl/docs/moe_code_agent.md#功能与支持边界).
   Check `rl/config.py` and `rl/roles/model_setup.py` for the executable boundary; do not infer RL support from a main-project API.
+- Qwen3.5-9B and Qwen3.8-27B declare the existing `qwen3_5` architecture. Their text Actors use the shared AutoModel and
+  `hyper_parallel/models/qwen3_5/` adapters; RL owns only identity, configuration and publication glue.
+  The initial path is GRPO, FSDP with training TP=CP=1, colocated native vLLM, consistency off, explicit
+  `max_num_seqs`, eager execution and `full_gather`. Native serving uses `--language-model-only`; publication
+  must cover every text checkpoint key before committing a policy version. The implementation and acceptance
+  status are separate; see the [Qwen3.8 integration plan](../../hyper_parallel/rl/docs/qwen3_8_development.md)
+  and [Code Agent recipes](../../hyper_parallel/rl/examples/code_agent/README.md).
 - Weight synchronization selects `full_gather` or `direct_reshard`, with IPC for colocated and HCCL for disjoint.
   Publication errors propagate; there is no automatic fallback. Preserve this contract when fixing failures.
 - Single-turn Python stdio tasks use `examples.code.agent` / `code_stdio` with the internal runner.
@@ -47,7 +54,8 @@ Load the affected product contract rather than every RL document.
 - External Codex and DeepSeek programs train each call under its actual prompt with episode-level GRPO.
   Complete call identities, shared rewards and policy versions are required. DP padding has zero loss and is excluded
   from episode reporting; segmented PPO is rejected. Legacy continuous builders require exact sampled-action prefixes.
-  External tool attribution uses the pinned Hermes parser evidence: infrastructure or unknown failures reject the update,
+  External tool attribution uses the pinned model-family parser evidence: Qwen3 uses Hermes, while the `qwen3_5`
+  text family uses the reviewed vLLM 0.23 Qwen3Coder XML delegate. Infrastructure or unknown failures reject the update,
   while verified malformed model actions remain in the episode. See the
   [agent contract](../../hyper_parallel/rl/docs/agentic_rl.md) for budgets, shutdown and support boundaries.
 - Repository Code Agent uses isolated Docker candidate and grader workspaces, a controller-owned model relay,
@@ -107,7 +115,7 @@ plans, temporary validation results, or facts already owned elsewhere.
   SandboxFusion, and explicit MoE/code/agent training workers. Missing runtime resources are not a passing result.
   The existing `test_rl_st.py` dense/consistency/PPO recipes remain independent. See the
   [feature validation guide](../../hyper_parallel/rl/docs/moe_code_agent.md) for configuration and evidence boundaries.
-- Follow the repository [testing rules](testing.md) and [UT rules](unit-test.md). ST launchers must not import Torch or HyperParallel during collection. Use the [UT guide](../../hyper_parallel/rl/docs/hyper_rl_ut.md) and
+- Follow the repository [testing rules](testing.md) and [UT rules](unit-test.md). ST launchers must not import Torch or HyperParallel during collection. Use the [UT ownership guidance](#validation-and-test-ownership) and
   [ST guide](../../hyper_parallel/rl/README.md#系统测试) for execution commands and resources.
 - For docs and agent rules, run `python3 .agent/scripts/check_agents_catalog.py`, Markdown lint, and checks for changed
   relative links and referenced paths. The catalog script only compares Skills/Agents tables against disk; it does not

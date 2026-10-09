@@ -63,11 +63,13 @@ _REPOSITORY_PERMISSION_PROFILE = (
     '</permission_profile>'
 )
 REPOSITORY_COMPACT_PROMPT = (
-    "HYPER_RL_CODE_AGENT_COMPACTION_V1\n"
-    "Summarize the repository issue, exact source paths and functions inspected, relevant code facts, "
-    "commands and their actual results, verified edits and tests, and the next concrete action. "
-    "Keep failed searches and unchanged files distinct from successful edits. "
-    "Write a concise state summary only; do not call tools."
+    "HYPER_RL_CODE_AGENT_COMPACTION_V2\n"
+    "Write only a compact handoff of at most 160 words in at most six bullets. Do not call tools. "
+    "Keep the repository issue and edit constraints, exact relevant source paths and function names, "
+    "current verified edits, latest test results, unresolved blockers, and the next concrete action. "
+    "Distinguish failed commands and unchanged files from successful edits. "
+    "Do not quote source code, patches, command output, or the chronological transcript. "
+    "Summarize the current state, not every previous attempt. Finish within this word limit."
 )
 
 

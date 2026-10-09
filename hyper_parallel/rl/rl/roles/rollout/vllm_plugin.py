@@ -24,6 +24,7 @@ from rl.consistency import (
     install_rollout_consistency_profile,
 )
 from rl.consistency.qwen3_dense import install_qwen3_rollout_rms_norm_diagnostic
+from rl.consistency.runtime import resolve_vllm_runtime
 from rl.roles.model_setup import (
     HYPER_QWEN3_ARCHITECTURE,
 )
@@ -34,8 +35,6 @@ HYPER_QWEN3_MODEL_CLASS = "rl.roles.rollout.consistency_models.qwen3.model:Hyper
 _HYPER_MODELS = {
     HYPER_QWEN3_ARCHITECTURE: HYPER_QWEN3_MODEL_CLASS,
 }
-_SUPPORTED_VLLM_VERSION = "0.22.1"
-_SUPPORTED_VLLM_ASCEND_VERSION = "0.22.1rc1"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -65,13 +64,6 @@ def register_hyper_models() -> None:
     # Native rollout uses these stable worker RPCs too; private lifecycle
     # patches are installed only after both pinned versions are verified.
     install_vllm_weight_sync_hooks(private_lifecycle=False)
-    if installed_version != _SUPPORTED_VLLM_VERSION:
-        _LOGGER.warning(
-            "Skipping Hyper model registration: vLLM %s is installed, but the adapter supports only %s.",
-            installed_version,
-            _SUPPORTED_VLLM_VERSION,
-        )
-        return
     try:
         installed_ascend_version = package_version("vllm-ascend").split("+", maxsplit=1)[0]
     except PackageNotFoundError:
@@ -79,13 +71,15 @@ def register_hyper_models() -> None:
             "Skipping Hyper model registration because vLLM-Ascend package metadata is unavailable."
         )
         return
-    if installed_ascend_version != _SUPPORTED_VLLM_ASCEND_VERSION:
+    runtime = resolve_vllm_runtime(installed_version, installed_ascend_version)
+    if runtime is None:
         _LOGGER.warning(
-            "Skipping Hyper model registration: vLLM-Ascend %s is installed, but the adapter supports only %s.",
+            "Skipping Hyper model registration for unsupported vLLM/vLLM-Ascend pair %s/%s.",
+            installed_version,
             installed_ascend_version,
-            _SUPPORTED_VLLM_ASCEND_VERSION,
         )
         return
+    _LOGGER.info("Installing Hyper runtime adapters: %s", runtime.name)
     install_vllm_weight_sync_hooks(private_lifecycle=True)
     install_tool_evidence()
     # vLLM is optional and imports this entry point only when installed.

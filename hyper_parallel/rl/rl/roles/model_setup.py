@@ -22,6 +22,7 @@ from typing import Any, Iterator, Mapping, Optional
 import torch
 
 from hyper_parallel import HSDPModule
+from hyper_parallel.models.qwen3_5.adapter.selected_log_probs import bind_token_log_probs
 
 _TRANSFORMERS_BUILTIN_ATTENTION = "transformers_builtin"
 
@@ -34,6 +35,7 @@ SUPPORTED_MODEL_IMPLEMENTATIONS = (
 HYPER_QWEN3_ARCHITECTURE = "HyperQwen3ForCausalLM"
 NATIVE_QWEN3_ARCHITECTURE = "Qwen3ForCausalLM"
 NATIVE_QWEN3_MOE_ARCHITECTURE = "Qwen3MoeForCausalLM"
+NATIVE_QWEN3_5_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,9 @@ class ModelRegistration:
             return "qwen3"
         if self.hf_architecture == NATIVE_QWEN3_MOE_ARCHITECTURE and self.model_type == "qwen3_moe":
             return "qwen3_moe"
+        if (self.hf_architecture == NATIVE_QWEN3_5_ARCHITECTURE
+                and self.model_type == "qwen3_5" and self.text_model_type == "qwen3_5_text"):
+            return "qwen3_5"
         raise ValueError(
             "Unsupported RL model identity: "
             f"architecture={self.hf_architecture!r}, model_type={self.model_type!r}, "
@@ -88,6 +93,12 @@ class VLLMModelRegistration:
         """Map one canonical Actor parameter name into the rollout namespace."""
         if name == "lm_head.weight" and self.model.tie_word_embeddings:
             return None
+        if self.family == "qwen3_5":
+            if name == "lm_head.weight":
+                return name
+            if name.startswith(("model.layers.", "model.embed_tokens.", "model.norm.")):
+                return "model.language_model." + name.removeprefix("model.")
+            raise ValueError(f"Expected a text-only Qwen3.5 Actor parameter, got {name!r}")
         return name
 
 
@@ -115,6 +126,7 @@ def architecture_for_implementation(
         },
     }
     architectures["qwen3_moe"] = {NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_MOE_ARCHITECTURE}
+    architectures["qwen3_5"] = {NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_5_ARCHITECTURE}
     try:
         return architectures[model_family][normalized]
     except KeyError as error:
@@ -147,6 +159,8 @@ def build_role_model(runtime_config: object, distributed_setup: object, *, froze
         activation_checkpoint=activation_checkpoint,
         peft_config=runtime_config.peft,
     )
+    if getattr(getattr(model, "config", None), "model_type", None) == "qwen3_5_text":
+        bind_token_log_probs(model)
     if frozen:
         for parameter in model.parameters():
             parameter.requires_grad_(False)
@@ -182,6 +196,7 @@ __all__ = [
     "NATIVE_MODEL_IMPLEMENTATION",
     "NATIVE_QWEN3_ARCHITECTURE",
     "NATIVE_QWEN3_MOE_ARCHITECTURE",
+    "NATIVE_QWEN3_5_ARCHITECTURE",
     "SUPPORTED_MODEL_IMPLEMENTATIONS",
     "VLLMModelRegistration",
     "architecture_for_implementation",

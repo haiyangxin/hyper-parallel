@@ -18,6 +18,8 @@ UT 包含 CPU 计算与 mock；真实模型、通信和数值效果需执行对�
 | Dense 训练拓扑边界 | `train.accelerator.dp_shard`、`tp`、`dp_replicate`、`cp`、`pp`、`ep`、`edp_shard` | `rl/config.py::_trainer_topology`、`rl/config.py::_validate_trainer_ep` | TP1/TP2；正整数 FSDP 分片数；其余维度固定为 1 | `tests/ut/rl/trainer/test_config_runtime.py::test_training_topology_is_checked_for_all_engines`、`tests/ut/rl/trainer/test_config_runtime.py::test_dense_runtime_rejects_expert_parallelism` |
 | Qwen3-30B-A3B 接入 | `examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_vllm.yaml`；`train.accelerator.ep`、`edp_shard` | `rl/config.py::_validate_model_scope`、`rl/config.py::_validate_moe_parallelism`、`rl/config.py::_model_plan_overrides` | 仅 GRPO、colocated native vLLM、consistency off、EPLB off；TP1/TP2，EP/EDP 整除训练规模，EP 整除专家数 | `tests/ut/rl/trainer/test_moe_config.py`；真机证据见 [M1 记录](../hyper_parallel/rl/docs/moe_code_agent.md#功能与支持边界) |
 
+| Qwen3.8 文本策略接入 | `examples/gsm8k/configs/qwen3_8_27b_gsm8k_vllm.yaml`；`RL_ST_QWEN3_5_CONFIG` | `rl/config.py::_validate_qwen3_5_scope`；公共 AutoModel 与 `models/qwen3_5`；`rl/roles/model_setup.py::VLLMModelRegistration.actor_weight_name` | 训练 TP=CP=1、FSDP、GRPO、colocated native/eager、consistency off、full_gather；文本权重完整性后提交版本；真机状态见[接入记录](../hyper_parallel/rl/docs/qwen3_8_development.md) | `tests/ut/rl/trainer/test_qwen3_5_runtime.py`、`tests/ut/auto_models/models/qwen3_5/test_training_contracts.py`；`hyper_parallel/rl/tests/st/_qwen3_5_train.py` |
+
 ## 2. 算法、目标与策略角色
 
 | 功能 | 配置或入口 | 实现分支 | 数据或指标 | 代表测试 |
@@ -47,7 +49,7 @@ UT 包含 CPU 计算与 mock；真实模型、通信和数值效果需执行对�
 | Codex 程序 | `agentic.runner=codex`、`agentic.codex.*` | `rl/roles/rollout/worker.py::CodexRolloutManager`、`rl/agentic/codex/`、`rl/agentic/core/program_runner.py` | 逐调用真实轨迹、episode GRPO；标准与 additional_tools、调用限流及排空 | `tests/ut/rl/agentic/agentic_ut.py`；NPU case `codex-agent` |
 | DeepSeek 程序 | `agentic.runner=deepseek`、`agentic.deepseek.*` | `rl/roles/rollout/worker.py::DeepSeekRolloutManager`、`rl/agentic/ds_harness/`、`rl/agentic/core/program_runner.py` | 自有协议下逐调用真实轨迹与 episode GRPO；分段 PPO 拒绝 | `tests/ut/rl/agentic/agentic_ut.py`；NPU case `deepseek-agent` |
 | Episode GRPO 与 DP 补齐 | 外部 program 返回完整逐调用轨迹 | `rl/dataset/episodes.py::episode_rows`、`rl/dataset/batch_builder.py::pad_agent_call_batch_for_dp` | episode 计奖、call 训练；padding 零损失且不计统计 | `tests/ut/rl/data/test_episodes.py`、`hyper_parallel/rl/tests/st/_agent_dp.py` |
-| 工具失败证据 | 外部 harness + Hermes，固定 vLLM 版本 | `rl/tool_protocol.py::inspect_tool_response`、`rl/agentic/codex/gateway.py`、`rl/agentic/ds_harness/gateway.py` | 原始 token/解析证据；模型、基础设施、未知归因；非法组拒绝 | `tests/ut/rl/agentic/test_agent_protocol.py` |
+| 工具失败证据 | 外部 harness；Qwen3 用 Hermes，`qwen3_5` 用固定 vLLM 0.23 的 Qwen3Coder | `rl/tool_protocol.py::inspect_tool_response`、`rl/tool_xml.py`、`rl/agentic/codex/gateway.py`、`rl/agentic/ds_harness/gateway.py` | 原始 token/解析证据及 XML 工具 schema；模型、基础设施、未知归因；非法组拒绝 | `tests/ut/rl/agentic/test_agent_protocol.py`、`test_tool_xml.py`、`test_tool_protocol_hooks.py` |
 | Agent 编排与收尾 | program TP owner、final checkpoint | `rl/agentic/core/program_runner.py::ProgramAgentRunner`、`rl/trainer.py` | 全程序组排空、跨 rank 错误同步、checkpoint 前释放服务 | `tests/ut/rl/agentic/test_agent_program.py`、`tests/ut/rl/trainer/test_agent_integration.py` |
 
 ## 4. 权重同步与发布
@@ -101,7 +103,7 @@ UT 包含 CPU 计算与 mock；真实模型、通信和数值效果需执行对�
 
 真实 RL ST 保留在 RL 子项目中，暂不由主项目 `tests/torch/` 门禁收集；需显式执行并准备模型、数据、镜像和设备。
 运行条件见 [ST 说明](../hyper_parallel/rl/README.md#系统测试)，PPO 验证边界见
-[PPO 文档](../hyper_parallel/rl/docs/ppo.md)，bit-exact 的条件见
+[算法与角色合同](../hyper_parallel/rl/docs/architecture.md)，bit-exact 的条件见
 [训练推理一致性](../hyper_parallel/rl/docs/qwen3_training_inference_consistency.md)。
 MoE、code 与外部 agent 的扩展 UT 已归入 `tests/ut/rl/` 对应模块。
 `hyper_parallel/rl/tests/st/test_feature_st.py` 提供 CPU/Gloo、真实沙箱和显式训练入口；
@@ -113,6 +115,8 @@ MoE、code 与外部 agent 的扩展 UT 已归入 `tests/ut/rl/` 对应模块。
 | 路径 | 配置/入口 | 实现 | 支持边界 | 验证 |
 | --- | --- | --- | --- | --- |
 | 仓库工作区与模型通道 | `examples/code_agent/task.py`、`rl/agentic.codex.task_factory`、`agentic.codex.model_context_window` | `rl/agentic/envs/docker_workspace.py`、`model_relay.py`、`rl/agentic/codex/{harness,gateway,checked_patch}.py` | 候选与判题容器隔离；管理凭证仅控制端持有，原始请求与采样保留；仓库任务限定两种真实工具并验证编辑字节，CLI 上下文窗口按模型服务配置 | `hyper_parallel/rl/tests/trial/test_{docker_workspace,model_relay,repository_program,gateway_transport,code_agent_edit_helper}.py` |
+| Qwen3.8 原生仓库配方 | `examples/code_agent/configs/qwen3_8_27b_code_agent.yaml`；`prepare_data --repeats 2` | 既有 `qwen3_5` Actor、Codex runner、repository task 与 full_gather | 四卡重复任务有独立采样身份；8K 服务容量须与实际逐调用训练峰值分别核验；基础 RL 与仓库训练验收分别记录 | [原生联调状态](../hyper_parallel/rl/docs/code_agent_development.md#qwen38-原生-code-agent-联调2026-10-08)；`hyper_parallel/rl/tests/trial/_repository_train.py` |
+| Qwen3.5-9B 仓库配方 | `examples/code_agent/configs/qwen3_5_9b_{code_agent,swebench}.yaml` | 既有 `qwen3_5` Actor、Codex、独立 grader、native-vLLM 与 full_gather | 参照 Agent Lightning 的 TP1、81920 上下文、12288 输出、100 次调用、thinking off、GRPO 学习率及 clip；保留 HP 的逐调用训练、真实 old logprob 和失败传播；小批次验收与完整基准区分 | `tests/ut/rl/trainer/test_qwen3_5_code_agent.py`；[仓库配方与验收](../hyper_parallel/rl/examples/code_agent/README.md) |
 | DeepSeek 仓库接线 | `examples/code_agent/configs/qwen3_30b_a3b_swebench_deepseek.yaml`；`agentic.deepseek.task_factory` | `rl/agentic/ds_harness/{harness,gateway}.py`、`rl/agentic/envs/model_relay.py`、`docker/Dockerfile.swebench-ds*` | DS runtime 在候选容器执行 `bash`；固定 Chat Completions、4 KiB 工具输出及原生摘要支持预算和停止后评分 | `hyper_parallel/rl/tests/trial/test_deepseek_repository_{config,gateway,program}.py`、`test_model_relay_chat.py`；[交接证据](../hyper_parallel/rl/docs/code_agent_handoff.md#deepseek-harness-对照工具输出与下一步动作) |
 | 外部 API 仅推理验收 | `examples/code_agent/inference.py` | `rl/agentic/codex/{gateway,protocol,harness}.py`；`CodexAgentProgram.run_inference` | 复用现有 CLI、工具、工作区与 grader；真实 API 调用记录和评分，不生成训练轨迹；密钥仅控制端持有 | [推理合同](../hyper_parallel/rl/examples/code_agent/README.md#外部-api-仅推理验收)；具体运行证据见交接记录 |
 | SWE-bench 小规模功能闭环 | `examples/code_agent/configs/qwen3_4b_swebench.yaml` | `examples/code_agent/swebench_{data,artifacts,task}.py` | 固定两例及官方评分；历史训练无有效修复或学习，外部 API 推理验收独立记录 | `hyper_parallel/rl/tests/trial/test_swebench_{artifacts,data,task,training}.py`；[当前推理证据](../hyper_parallel/rl/docs/code_agent_handoff.md#外部-api-仅推理验收2026-09-28) |

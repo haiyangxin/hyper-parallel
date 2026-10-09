@@ -55,9 +55,9 @@ def test_agent_dp_padding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards",
           essential_mark="essential")
-@pytest.mark.parametrize("feature", ["moe", "code", "agent"])
+@pytest.mark.parametrize("feature", ["moe", "code", "agent", "qwen3_5"])
 def test_feature_training(feature: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Feature: MoE, code and external agent production training.
+    """Feature: MoE, code, external agents and hybrid text-policy training.
 
     Description: launch the selected feature worker with an explicit local recipe.
     Expectation: two updates, real parameter changes and feature contracts pass.

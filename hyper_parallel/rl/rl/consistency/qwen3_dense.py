@@ -19,23 +19,22 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+from rl.consistency.runtime import SUPPORTED_VLLM_RUNTIMES, resolve_vllm_runtime
 from rl.consistency.vllm_ascend import install_partial_prefill_rng_fix
 
 CONSISTENCY_PROFILE_OFF = "off"
 QWEN3_ASCEND_CONSISTENCY_V1 = "qwen3_ascend_consistency_v1"
 _TRAINER_ATTENTION_IMPLEMENTATION = "hyper_qwen3_npu_consistent_v1"
-_EXPECTED_PACKAGE_VERSIONS = {
+_NUMERICAL_PACKAGE_VERSIONS = {
     "batch-invariant-ops": "1.0.0",
     "flash-attn-npu": "0.2.0b1",
     "transformers": "5.5.4",
-    "vllm": "0.22.1",
-    "vllm-ascend": "0.22.1rc1",
 }
 _ROLLOUT_PROFILE_SETTINGS = {
     "attention_backend": "FLASH_ATTN",
@@ -63,6 +62,7 @@ class _ConsistencyRuntime:
     installed_profile: str = CONSISTENCY_PROFILE_OFF
     installed_rollout_profile: str = CONSISTENCY_PROFILE_OFF
     batch_invariant_sum_compatibility_installed: bool = False
+    dependency_runtime: str = "unconfigured"
 
 
 _runtime = _ConsistencyRuntime()
@@ -81,6 +81,7 @@ def consistency_runtime_state() -> dict[str, Any]:
         "batch_invariant_sum_compatibility_installed": (
             _runtime.batch_invariant_sum_compatibility_installed
         ),
+        "dependency_runtime": _runtime.dependency_runtime,
     }
 
 
@@ -100,7 +101,7 @@ def _reduce_non_last_dimension(
 
 
 def _install_batch_invariant_sum_compatibility() -> None:
-    """Keep AscendC sum enabled while supporting PyTorch's non-last reductions."""
+    """Keep AscendC sum enabled with PyTorch dimensions and dtype semantics."""
     if _runtime.batch_invariant_sum_compatibility_installed:
         return
     try:
@@ -109,24 +110,44 @@ def _install_batch_invariant_sum_compatibility() -> None:
         raise ValueError(
             f"Qwen3 batch-invariant sum compatibility is unavailable: {error}"
         ) from error
-    original_reduce_sum = batch_invariant_module.reduce_sum
+    original_torch_sum = batch_invariant_module.torch_sum
     reduce_sum_op = getattr(
         batch_invariant_module.torch.ops.batch_invariant_ops,
         "npu_reduce_sum_batch_invariant",
     )
 
+    def sum_all_dimensions(tensor: Any, *, dtype: Optional[torch.dtype] = None) -> Any:
+        """Supply the dimension omitted by the aten::sum default overload."""
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        if not tensor.is_floating_point() or tensor.numel() == 0:
+            # Integer reductions need PyTorch's int64 promotion, not the floating kernel.
+            return torch.ops.aten.sum.dim_IntList(tensor, [], False, dtype=dtype)
+        return reduce_sum_op(tensor.reshape(-1).contiguous(), -1, False)
+
     def reduce_sum(
         tensor: Any,
-        dim: Optional[int] = None,
+        dim: Optional[Union[int, tuple[int, ...], list[int]]] = None,
         keepdim: bool = False,
+        *,
+        dtype: Optional[torch.dtype] = None,
     ) -> Any:
-        """Route non-last NPU reductions through a stable moved last axis."""
-        if (
-            getattr(tensor.device, "type", None) == "npu"
-            and isinstance(dim, int)
-            and tensor.dim() > 0
-            and dim % tensor.dim() != tensor.dim() - 1
-        ):
+        """Preserve the single-axis kernel while restoring standard sum interfaces."""
+        if getattr(tensor.device, "type", None) != "npu":
+            return original_torch_sum(tensor, dim=dim, keepdim=keepdim, dtype=dtype)
+        if dim is None:
+            result = sum_all_dimensions(tensor, dtype=dtype)
+            return result.reshape([1] * tensor.dim()) if keepdim else result
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        if not isinstance(dim, int) or not tensor.is_floating_point() or tensor.numel() == 0:
+            dimensions = [dim] if isinstance(dim, int) else dim
+            return torch.ops.aten.sum.dim_IntList(tensor, dimensions, keepdim, dtype=dtype)
+        if tensor.dim() == 0:
+            return torch.ops.aten.sum.dim_IntList(tensor, [dim], keepdim, dtype=dtype)
+        if dim < -tensor.dim() or dim >= tensor.dim():
+            raise IndexError(f"Sum dimension {dim} is out of range for a {tensor.dim()}-dimensional tensor")
+        if dim % tensor.dim() != tensor.dim() - 1:
             return _reduce_non_last_dimension(
                 tensor,
                 dim,
@@ -137,8 +158,13 @@ def _install_batch_invariant_sum_compatibility() -> None:
                     preserve_dim,
                 ),
             )
-        return original_reduce_sum(tensor, dim, keepdim)
+        return reduce_sum_op(tensor.contiguous(), -1, keepdim)
 
+    # Upstream binds aten::sum (no dim) directly to an op that requires dim.
+    # Correct the dispatcher too, since Tensor.sum bypasses the torch.sum wrapper.
+    batch_invariant_module._batch_invariant_LIB.impl(  # pylint: disable=protected-access
+        "aten::sum", sum_all_dimensions, "NPU", allow_override=True,
+    )
     batch_invariant_module.reduce_sum = reduce_sum
     batch_invariant_module.torch.sum = reduce_sum
     _runtime.batch_invariant_sum_compatibility_installed = True
@@ -397,7 +423,7 @@ def trainer_sequence_log_probs(
 
 def _require_package_versions() -> None:
     """Fail closed unless every version-pinned profile dependency is installed."""
-    for distribution, expected in _EXPECTED_PACKAGE_VERSIONS.items():
+    for distribution, expected in _NUMERICAL_PACKAGE_VERSIONS.items():
         try:
             installed = package_version(distribution).split("+", maxsplit=1)[0]
         except PackageNotFoundError as error:
@@ -408,6 +434,28 @@ def _require_package_versions() -> None:
             raise ValueError(
                 f"Consistency profile requires {distribution}=={expected}, got {installed}"
             )
+    try:
+        vllm_version = package_version("vllm")
+        ascend_version = package_version("vllm-ascend")
+    except PackageNotFoundError as error:
+        raise ValueError("Consistency profile requires vLLM and vLLM-Ascend package metadata") from error
+    runtime = resolve_vllm_runtime(vllm_version, ascend_version)
+    if runtime is None:
+        pairs = [(profile.vllm_version, profile.ascend_version) for profile in SUPPORTED_VLLM_RUNTIMES]
+        raise ValueError(
+            f"Consistency profile requires a supported vLLM/vLLM-Ascend pair {pairs}, "
+            f"got {(vllm_version, ascend_version)}"
+        )
+    for distribution, expected in runtime.consistency_versions:
+        try:
+            installed = package_version(distribution).split("+", maxsplit=1)[0]
+        except PackageNotFoundError as error:
+            raise ValueError(f"Consistency runtime {runtime.name} requires {distribution}=={expected}") from error
+        if installed != expected:
+            raise ValueError(
+                f"Consistency runtime {runtime.name} requires {distribution}=={expected}, got {installed}"
+            )
+    _runtime.dependency_runtime = runtime.name
 
 
 def validate_rollout_consistency_profile(profile: str) -> None:

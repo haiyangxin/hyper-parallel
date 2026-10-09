@@ -191,7 +191,9 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 - `rollout.engine` 必须是 `vllm`。
 - `rollout.vllm.logprobs_mode` 必须是 `raw_logprobs`。
 - `rollout.vllm.enable_auto_tool_choice` 必须为 `true`。
-- `rollout.vllm.tool_call_parser` 必须是 `hermes`，原始解析证据仅适配固定镜像中的该解析器。
+- `rollout.vllm.tool_call_parser` 按模型家族选择：Qwen3 使用 `hermes`；Qwen3.8 的 `qwen3_5`
+  文本架构使用固定 vLLM 0.23 中已审查的 `qwen3_coder`。记录实际解析器、原始 token/text、
+  请求工具 schema 和解析结果；格式与解析器不匹配、证据缺失或冲突仍拒绝训练。
 - Gateway 端口不能与 vLLM 端口相同。
 - Codex CLI 当前固定验证版本为 `0.152.1`。
 - DeepSeek Harness SDK 当前固定验证版本为 `0.1.1rc1`。
@@ -220,12 +222,12 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 
 ## 当前实现边界
 
-- 当前支持的训练算法是 GRPO 和 PPO；实际验证范围以[特性清单](current_feature_inventory.md)及
-  [系统测试指南](hyper-rl-st.md)为准。多节点和异步 rollout 不在本文描述的实现范围内。
+- 当前支持的训练算法是 GRPO 和 PPO；实际验证范围以[功能导航](../../../docs/rl-navigation.md)及
+  [系统测试指南](../README.md#系统测试)为准。多节点和异步 rollout 不在本文描述的实现范围内。
 - 外部 runner 复用唯一共享 vLLM endpoint，不创建第二个 rollout Router 或 rank-local server。
 - External harness 的语义循环可以不同，但必须返回标准、token 对齐且策略身份一致的 `Trajectory`。
 - Agentic UT 可从仓库根目录运行 `pytest -q tests/ut/rl/agentic/agentic_ut.py`；
-  独立脚本的 coverage 门槛及已有缺口见 [UT 指南](hyper_rl_ut.md)。
+  UT 与真实设备测试的验收边界见 [RL 测试规则](../../../.agent/rules/hyper-rl.md#validation-and-test-ownership)。
 
 ## 验证入口
 

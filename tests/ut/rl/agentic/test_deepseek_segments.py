@@ -69,7 +69,8 @@ def test_deepseek_runtime_retains_rewritten_context_and_episode_status(
     monkeypatch.setattr(harness, "_http_json", http_json)
     monkeypatch.setattr(harness, "_load_reward_callable", lambda _value: lambda _answer, _prompt: RewardResult(1.0))
     config = {"session_root": str(tmp_path), "max_turns": 2, "max_new_tokens": 8, "temperature": 1.0,
-              "top_p": 1.0, "top_k": 0, "max_episode_tokens": 64, "timeout_seconds": 60}
+              "top_p": 1.0, "top_k": 0, "max_episode_tokens": 64, "timeout_seconds": 60,
+              "reward_callable": "examples.gsm8k.agent:score_deepseek_gsm8k_answer"}
     program = harness.DeepSeekAgentProgram(
         prompt, 1, 0, "http://gateway/v1", "http://gateway", config, 99, admin_token="controller-token",
     )

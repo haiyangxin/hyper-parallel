@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Consistency-only patches for the pinned vLLM-Ascend runtime."""
+"""Consistency-only patches for reviewed vLLM-Ascend runner interfaces."""
 
 # The pinned vLLM runner exposes partial-prefill sampling only through these private hooks.
 # pylint: disable=protected-access
@@ -27,6 +27,9 @@ def patch_partial_prefill_rng(model_runner_cls: type[Any]) -> None:
     """Restore seeded generators after vLLM discards partial-prefill samples."""
     if getattr(model_runner_cls, "_hyper_rl_partial_prefill_rng_patched", False):
         return
+    for method in ("_sample", "_bookkeeping_sync"):
+        if not callable(getattr(model_runner_cls, method, None)):
+            raise ValueError(f"vLLM-Ascend runner does not expose the reviewed {method} interface")
     original_sample = model_runner_cls._sample
     original_bookkeeping = model_runner_cls._bookkeeping_sync
 
@@ -59,19 +62,19 @@ def patch_partial_prefill_rng(model_runner_cls: type[Any]) -> None:
         offsets = getattr(model_runner, _PRE_SAMPLE_GENERATOR_OFFSETS, None)
         if offsets is None:
             raise RuntimeError("vLLM bookkeeping ran without captured generator offsets")
-        discarded_indices = model_runner.discard_request_indices.np[
-            : model_runner.num_discarded_requests
-        ]
-        discarded_generators = []
-        for request_index in discarded_indices:
-            generator = model_runner.input_batch.generators.get(int(request_index))
-            if generator is None:
-                continue
-            captured = offsets.get(id(generator))
-            if captured is None or captured[0] is not generator:
-                raise RuntimeError("vLLM changed a seeded generator before bookkeeping")
-            discarded_generators.append(captured)
         try:
+            discarded_indices = model_runner.discard_request_indices.np[
+                : model_runner.num_discarded_requests
+            ]
+            discarded_generators = []
+            for request_index in discarded_indices:
+                generator = model_runner.input_batch.generators.get(int(request_index))
+                if generator is None:
+                    continue
+                captured = offsets.get(id(generator))
+                if captured is None or captured[0] is not generator:
+                    raise RuntimeError("vLLM changed a seeded generator before bookkeeping")
+                discarded_generators.append(captured)
             result = original_bookkeeping(model_runner, *args, **kwargs)
             for generator, offset in discarded_generators:
                 generator.set_offset(offset)

@@ -81,6 +81,7 @@ class ParameterHookMigrator:
     """Preserve parameter backward hooks across HSDP parameter replacement."""
 
     def __init__(self) -> None:
+        """Initialize storage for saved hooks and their deduplication identities."""
         self._orig_param_hooks: List[Callable] = []
         self._saved_hook_ids: set[int] = set()
 
@@ -140,7 +141,7 @@ class HSDPParamV2:
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[torch.device] = None,
         source_shard_info: Optional[SourceShardMetaInfo] = None,
-    ):
+    ) -> None:
         """
         Initialize HSDPParamV2 and shard the parameter.
 
@@ -392,6 +393,7 @@ class HSDPParamV2:
 
     @reduce_partial_output.setter
     def reduce_partial_output(self, value: Optional[torch.Tensor]) -> None:
+        """Set the reduce-scatter buffer accumulated before the final micro-step."""
         self._reduce_partial_output = value
 
     def reduce_comm_dtype(self, grad: Optional[torch.Tensor] = None) -> torch.dtype:
@@ -449,7 +451,8 @@ class HSDPParamV2:
         """Clear the all-reduce output tensor to free memory."""
         self.all_reduce_comm_ctx.all_reduce_output = None
 
-    def clear_unsharded_source_grad(self):
+    def clear_unsharded_source_grad(self) -> None:
+        """Drop the accumulated or parameter gradient consumed by reduction."""
         if self.unsharded_accumulated_grad_data is not None:
             self.unsharded_accumulated_grad = None
         elif self.unsharded_param.grad is not None:
@@ -680,7 +683,7 @@ class HSDPParamV2:
         world_size: int,
         device: torch.device,
         force_recreate: bool = False,
-    ):
+    ) -> None:
         """
         Allocate buffers that hold unsharded parameter data.
 
@@ -758,12 +761,14 @@ class HSDPParamV2:
         )
 
     def to_sharded(self) -> None:
+        """Install the sharded parameter and release separate unsharded storage."""
         self._setattr_on_modules(self.sharded_param)
         if self.unsharded_param_buffers[0] is not self._sharded_param_data:
             self.free_unsharded_param()
         self.sharded_state = ShardedState.SHARDED
 
     def to_unsharded(self) -> None:
+        """Install the unsharded parameter with the current gradient policy."""
         set_requires_grad_if_needed(self.sharded_param, self._unsharded_param)
         self._setattr_on_modules(self._unsharded_param)
         self.sharded_state = ShardedState.UNSHARDED
@@ -804,6 +809,7 @@ class HSDPParamV2:
         return sharded_dtensor
 
     def to_accumulated_grad_if_needed(self) -> None:
+        """Move the current gradient into the reduction-dtype accumulation buffer."""
         if self._unsharded_param.grad is None:
             return
         # Keep local gradients alive across no-sync / delayed-sync steps even
@@ -818,6 +824,7 @@ class HSDPParamV2:
             self.unsharded_accumulated_grad += unsharded_grad
 
     def accumulate_unsharded_grad_if_needed(self) -> None:
+        """Add the current gradient to an existing accumulated gradient buffer."""
         if (
             self.unsharded_accumulated_grad is not None
             and self.unsharded_param.grad is not None
@@ -976,8 +983,9 @@ class HSDPParamV2:
                 "Expected sharded_param._local_tensor to be contiguous"
             )
 
+    @torch.no_grad()
     def reset_sharded_param(self) -> None:
-        """Reset sharded param after load_state_dict."""
+        """Refresh loaded shard storage without retaining an autograd path to the old parameter."""
         new_param = self._resolve_reset_param()
         local_tensor = new_param._local_tensor if isinstance(new_param, DTensor) else new_param
         if local_tensor.is_meta:
@@ -1079,6 +1087,11 @@ class HSDPParamV2:
 
 
     def unshard(self, async_op: bool = False) -> None:
+        """Start parameter all-gather unless a prefetched operation is pending.
+
+        Args:
+            async_op: Whether to launch all-gather asynchronously.
+        """
         if self.allgather_comm_ctx.allgather_handle is not None:
             # Already triggered by HSDPState.prefetch(), so return directly.
             return  # no-op
@@ -1086,6 +1099,7 @@ class HSDPParamV2:
 
 
     def wait_for_unshard(self) -> None:
+        """Wait for pending all-gather and install the full unsharded parameter."""
         self._assert_in_states(ShardedState.SHARDED)
 
         if self.allgather_comm_ctx.allgather_handle is not None:
