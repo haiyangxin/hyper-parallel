@@ -208,6 +208,13 @@ def _validate_training_sizes(
 
 def _validate_evaluation(evaluation: Mapping[str, Any]) -> None:
     """Validate optional evaluation limits."""
+    if not isinstance(evaluation.get("before_train", False), bool):
+        raise ValueError("evaluation.before_train must be a boolean")
+    interval = evaluation.get("every_n_steps")
+    if interval is not None and (isinstance(interval, bool) or not isinstance(interval, int) or interval < 0):
+        raise ValueError("evaluation.every_n_steps must be a non-negative integer or null")
+    if not isinstance(evaluation.get("at_end", False), bool):
+        raise ValueError("evaluation.at_end must be a boolean")
     if not bool(evaluation.get("enabled", True)):
         return
     if not isinstance(evaluation.get("ignore_eos", False), bool):
@@ -332,8 +339,6 @@ def _validate_colocated_vllm(
         raise ValueError(
             "Colocated rollout requires a multi-rank Trainer topology"
         )
-    if not bool(accelerator.get("cpu_offload", False)):
-        raise ValueError("Colocated rollout requires train.accelerator.cpu_offload=true")
     if not bool(accelerator.get("reshard_after_forward", True)):
         raise ValueError(
             "Colocated rollout requires train.accelerator.reshard_after_forward=true"
@@ -404,8 +409,17 @@ def _validate_disjoint_vllm(
 
 def _validate_vllm_limits(vllm: Mapping[str, Any]) -> None:
     """Validate optional vLLM concurrency and capacity limits."""
-    if not isinstance(vllm.get("trust_remote_code", True), bool):
-        raise ValueError("rollout.vllm.trust_remote_code must be a boolean")
+    if "seed" in vllm:
+        seed = vllm["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError("rollout.vllm.seed must be a non-negative integer")
+    if "task_queue_enable" in vllm:
+        queue_mode = vllm["task_queue_enable"]
+        if isinstance(queue_mode, bool) or not isinstance(queue_mode, int) or queue_mode not in (1, 2):
+            raise ValueError("rollout.vllm.task_queue_enable must be 1 or 2")
+    for name, default in (("trust_remote_code", True), ("disable_log_stats", False)):
+        if not isinstance(vllm.get(name, default), bool):
+            raise ValueError(f"rollout.vllm.{name} must be a boolean")
     if "request_concurrency" in vllm:
         raise ValueError(
             "rollout.vllm.request_concurrency was replaced by automatic child admission "
@@ -609,6 +623,10 @@ def _validate_vllm(
     deployment, rollout_dp, rollout_tp = _validate_vllm_basics(vllm)
     trainer_world_size = _trainer_world_size(accelerator)
     if deployment == "colocated":
+        if not accelerator.get("cpu_offload", False) and (
+            model_registration.family != "qwen3" or int(accelerator.get("tp", 1)) != 1
+        ):
+            raise ValueError("Colocated device-resident training currently requires Qwen3 dense with TP1")
         _validate_colocated_vllm(vllm, accelerator, trainer_world_size, rollout_dp, rollout_tp)
     else:
         _validate_disjoint_vllm(vllm, trainer_world_size, rollout_dp, rollout_tp)
@@ -895,10 +913,37 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
         raise ValueError(f"Segmented {name} agent trajectories currently require GRPO")
     evaluation = required_mapping(config, "evaluation")
     train = required_mapping(config, "train")
+    if train.get("old_log_prob_source", "rollout") not in ("rollout", "actor"):
+        raise ValueError("train.old_log_prob_source must be rollout or actor")
+    collect_log_probs = rollout.get("collect_log_probs", True)
+    if not isinstance(collect_log_probs, bool):
+        raise ValueError("rollout.collect_log_probs must be a boolean")
+    if not collect_log_probs:
+        if train.get("old_log_prob_source", "rollout") != "actor":
+            raise ValueError("rollout.collect_log_probs=false requires train.old_log_prob_source=actor")
+        if agentic.get("runner", "internal") != "internal":
+            raise ValueError("Disabling rollout log-probabilities requires the internal runner")
+        if (consistency_profile(config) != CONSISTENCY_PROFILE_OFF
+                or parse_distillation_config(config.get("distillation")).enabled):
+            raise ValueError("Consistency and distillation require rollout log-probabilities")
     if train.get("model_init_cpu_threads") is not None:
         _positive_integer(train, "model_init_cpu_threads", "train")
     accelerator = required_mapping(train, "accelerator")
+    for name in ("cpu_offload", "reference_cpu_offload"):
+        if name in accelerator and not isinstance(accelerator[name], bool):
+            raise ValueError(f"train.accelerator.{name} must be a boolean")
+    zero_copy = accelerator.get("comm_fusion_zero_copy")
+    if zero_copy is not None and not isinstance(zero_copy, bool):
+        raise ValueError("train.accelerator.comm_fusion_zero_copy must be a boolean or null")
+    if not isinstance(train.get("gradient_sync_each_micro_batch", False), bool):
+        raise ValueError("train.gradient_sync_each_micro_batch must be a boolean")
+    if uses_colocated_vllm(config) and not accelerator.get("cpu_offload", False):
+        if algorithm.name != "grpo" or consistency_profile(config) != CONSISTENCY_PROFILE_OFF:
+            raise ValueError("Colocated device-resident training currently requires GRPO with consistency off")
     optimizer = required_mapping(train, "optimizer")
+    no_decay = optimizer.get("no_decay_params", ["bias", "norm", "ln_"])
+    if not isinstance(no_decay, (list, tuple)) or any(not isinstance(name, str) for name in no_decay):
+        raise ValueError("train.optimizer.no_decay_params must be a list of parameter-name strings")
     main_params = _optimizer_fp32_main_params(optimizer)
     mixed_precision = required_mapping(train, "mixed_precision")
     if main_params and (not mixed_precision.get("enabled", True) or
@@ -911,6 +956,24 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
             raise ValueError("Actor and Critic must use the same fp32_main_params policy")
     model_registration = build_model_registration(config)
     _validate_model_scope(config, model_registration)
+    token_budgets = ("max_tokens_per_micro_batch", "old_log_prob_max_tokens_per_micro_batch",
+                     "reference_log_prob_max_tokens_per_micro_batch")
+    for field in token_budgets:
+        if train.get(field) is not None:
+            _positive_integer(train, field, "train")
+    if any(train.get(field) is not None for field in token_budgets):
+        if (model_registration.family != "qwen3" or int(accelerator.get("tp", 1)) != 1
+                or algorithm.name != "grpo" or consistency_profile(config) != CONSISTENCY_PROFILE_OFF
+                or parse_distillation_config(config.get("distillation")).enabled):
+            raise ValueError(
+                "Dynamic Actor batching requires Qwen3 dense TP1 GRPO with consistency off, no distillation"
+            )
+    reference_offload = accelerator.get("reference_cpu_offload", accelerator.get("cpu_offload", False))
+    if reference_offload != accelerator.get("cpu_offload", False) and (
+        model_registration.family != "qwen3" or int(accelerator.get("tp", 1)) != 1
+        or algorithm.name != "grpo" or consistency_profile(config) != CONSISTENCY_PROFILE_OFF
+    ):
+        raise ValueError("Independent Reference offload requires Qwen3 dense TP1 GRPO with consistency off")
     validate_consistency_model_identity(config, model_registration)
     _validate_model_and_data_paths(model, data, evaluation)
     _validate_training_sizes(train, rollout, data, algorithm, agentic)
@@ -1279,7 +1342,7 @@ def _build_optimizer_target(optimizer_config: Mapping[str, Any]) -> Target:
         AdamW,
         target_path="hyper_parallel.components.optim.AdamW",
         adamw_config=optimizer_kwargs,
-        no_decay_params=["bias", "norm", "ln_"],
+        no_decay_params=optimizer_config.get("no_decay_params", ["bias", "norm", "ln_"]),
     )
 
 
@@ -1422,6 +1485,7 @@ def _build_fsdp_config(
         reshard_after_backward=False,
         requires_grad_sync=True,
         comm_fusion=bool(accelerator_config.get("comm_fusion", True)),
+        comm_fusion_zero_copy=accelerator_config.get("comm_fusion_zero_copy"),
     )
 
 
@@ -1452,14 +1516,19 @@ def _model_plan_overrides(family: str) -> list[PlanOverride]:
 def _runtime_backend(train_config: Mapping[str, Any], accelerator_config: Mapping[str, Any]) -> str:
     """Include CPU communication when optimizer state is offloaded."""
     backend = str(train_config.get("comm_backend") or "hccl")
-    if bool(accelerator_config.get("cpu_offload", False)) and ":" not in backend:
+    if (accelerator_config.get("cpu_offload", False)
+            or accelerator_config.get("reference_cpu_offload", False)) and ":" not in backend:
         device_type = (torch.accelerator.current_accelerator() or torch.device("cpu")).type
         backend = f"cpu:gloo,{device_type}:{backend}"
     return backend
 
 
-def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> TrainerConfig:
+def build_runtime_config(
+    config: Mapping[str, Any], *, critic: bool = False, reference: bool = False,
+) -> TrainerConfig:
     """Translate Hyper-RL YAML into the HyperAutoModel runtime configuration."""
+    if critic and reference:
+        raise ValueError("A role cannot be both Critic and Reference")
     registration = build_model_registration(config)
     _validate_model_scope(config, registration)
     if critic and registration.family == "qwen3_moe":
@@ -1469,6 +1538,13 @@ def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> 
     model_config = required_mapping(config, "model")
     train_config = required_mapping(config, "train")
     accelerator_config = required_mapping(train_config, "accelerator")
+    if reference:
+        accelerator_config = {
+            **accelerator_config,
+            "cpu_offload": accelerator_config.get(
+                "reference_cpu_offload", accelerator_config.get("cpu_offload", False)
+            ),
+        }
     optimizer_config = required_mapping(train_config, "optimizer")
     mixed_precision_config = required_mapping(train_config, "mixed_precision")
     checkpoint_config = required_mapping(train_config, "checkpoint")

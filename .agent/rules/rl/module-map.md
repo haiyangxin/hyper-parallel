@@ -16,6 +16,7 @@ Interface semantics live in product docs. Feature-to-config/code/metric/test tra
 | Colocated reward service | `hyper_parallel/rl/rl/reward_model/`; GSM8K rule and model scorers in `hyper_parallel/rl/examples/gsm8k/agent.py` | [Reward model contract](../../../hyper_parallel/rl/docs/reward_model.md); NPU acceptance pending |
 | Algorithms | `hyper_parallel/rl/rl/algorithm/`, `hyper_parallel/rl/rl/registry.py` | [Feature navigation](../../../docs/rl-navigation.md), [training step](../../../hyper_parallel/rl/docs/architecture.md#一个训练步) |
 | Actor, Reference, Critic | `hyper_parallel/rl/rl/roles/policy/actor.py`, `hyper_parallel/rl/rl/roles/policy/critic.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md) |
+| Actor update and frozen log-prob token-budget scheduling | `hyper_parallel/rl/rl/roles/policy/dynamic_batch.py`; shared selector in `hyper_parallel/data/batching/packing.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md); RL owns optimizer membership, frozen-forward row restoration, target alignment and DP call counts |
 | MoE router replay | `hyper_parallel/rl/rl/router_replay.py`, `hyper_parallel/rl/rl/roles/policy/router_adapter.py`, `hyper_parallel/rl/rl/roles/rollout/router_capture.py` | [Replay contract](../../../hyper_parallel/rl/docs/vllm_rollout.md#moe-r3-路由重放), [usage and verification](../../../hyper_parallel/rl/docs/moe_code_agent.md#moe-r3); RL-owned capture/state/instance adaptation, no shared model changes |
 | Training model and optimizer factories | `hyper_parallel/rl/rl/roles/model_setup.py` | [Model construction](../../../hyper_parallel/rl/docs/architecture.md#master-模型接入) |
 | Process and service cleanup | `hyper_parallel/rl/rl/utils/process_cleanup.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md) |
@@ -47,3 +48,11 @@ The runtime supports Qwen3 dense GRPO/PPO/GSPO and Qwen3-MoE GRPO under the
 MoE construction uses the shared `hyper_parallel/models/qwen3_moe/` recipe; RL weight conversion remains under
 `hyper_parallel/rl/rl/weight_sync/`. Shared-project changes follow their own module rules.
 Packaging changes belong to the root `setup.py` and `MANIFEST.in`.
+
+## GSM8K performance experiments
+
+The [experiment workspace](../../../hyper_parallel/rl/examples/gsm8k/experiments/README.md) owns portable
+single-step runners, frozen source snapshots, contention monitoring and the
+[optimization tracker](../../../hyper_parallel/rl/examples/gsm8k/experiments/optimization_tracking.md).
+CPU utility tests live in `tests/ut/rl/trainer/test_frozen_forward_tools.py`; historical aggregate results
+are retained alongside the example, while raw logs, weights, data and host cleanup policy remain external.

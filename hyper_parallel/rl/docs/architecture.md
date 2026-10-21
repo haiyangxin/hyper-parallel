@@ -66,6 +66,40 @@ Checkpoint 绑定蒸馏目标与教师元数据身份。完整合同、配方和
 当前代码文件清单、隔离适配边界、回退范围和验证状态见 [模块导航](../../../docs/rl-navigation.md)。
 
 `rl/config.py` 将既有 YAML 转换为 master 的 `TrainerConfig`、`OptimizerConfig` 和 FSDP 配置。
+`train.accelerator.cpu_offload` 控制 Actor/优化器（及存在时的 Critic）；
+`reference_cpu_offload` 可独立覆盖 Reference，省略时继承 `cpu_offload`。
+每个角色复用共享 FSDP 的 offload policy，并共享原有通信网格；Reference 覆盖不改变 Actor 的构建配置。
+共卡无 offload 当前限于 Qwen3 dense、训练 TP1、GRPO、consistency off；Reward Model 仍要求 offload。
+发布前统一等待 HSDP 流、重新分片、清理临时缓存；CPU offload 检查 CPU 状态，常驻模式检查设备参数和矩状态，
+允许优化器的 CPU 标量计步器。常驻分片、FP32 主参数和优化器状态会与推理权重、KV cache 共同占用设备内存。
+`train.gradient_sync_each_micro_batch=true` 复用 HSDP 的逐 microbatch 梯度归约；默认 false 时，
+无 offload 路径在 mini-batch 末尾归约，CPU offload 路径始终逐 microbatch 归约。
+该开关不改变每个 mini-batch 一次优化器更新的语义；延迟归约会保留更多完整梯度，需要独立检查峰值内存。
+`train.accelerator.comm_fusion_zero_copy` 直接传递共享 FSDP 的同名选项；省略/null 保留底层默认。
+通信融合开启时，设备常驻的同 dtype 分片可使用 flat buffer，避免每次 all-gather 的输入打包复制；
+CPU offload 分片不使用该路径。显式 false 可单独测量这项已有能力的收益。
+
+共卡权重传输完成后、唤醒 rollout KV cache 前，再执行一次共享 HSDP 状态释放及 allocator cache 清理。
+接收端确认同步加载后才进入该边界，避免 publication 的临时聚合/IPC 缓存与推理 KV 内存同时驻留。
+仍在使用的参数和优化器状态保留原驻留策略；释放失败时不唤醒 rollout，也不提交新策略版本。
+
+`train.max_tokens_per_micro_batch` 为正整数时启用 Actor 动态分批，省略或 null 保留固定条数模式。
+预算计入完整 prompt、response 及 micro-batch 内的 padding，单条完整序列超预算会显式报错。
+当前范围是 Qwen3 dense、TP1、GRPO、consistency off、无蒸馏，要求 canonical 轨迹与连续右 padding。
+RL 在每个原有 optimizer mini-batch 内按长度排序，复用共享 `FirstFitPackingSelector` 选择样本，
+再限制矩形输入的实际 token 数；不改变 mini-batch 成员、更新次数或全局有效 action-token 的 loss 归一化。
+各 DP rank 通过拆分本地分组对齐前反向调用次数，不复制或丢弃样本；无法无空批对齐时所有 ranks 报错。
+CPU offload 仍按每个 micro-batch 归约；常驻模式仍可最后一个 micro-batch 归约。
+此配置只控制 Actor 更新。old log-prob 和 Reference 前向默认继续使用 `train.micro_batch_size`。
+分别设置 `train.old_log_prob_max_tokens_per_micro_batch`、`train.reference_log_prob_max_tokens_per_micro_batch`
+可独立启用无梯度前向的动态分批；省略/null 保留固定条数。范围与 Actor 动态分批相同。
+前向复用同一长度分组和矩形预算机制，跨 DP 对齐 FSDP 调用次数，裁剪后恢复原样本顺序及概率形状；
+padding 位置不参与损失，不要求保留原 padding 概率。单条超预算或无法无空批对齐时显式失败。
+Reference 使用其实际 DP 组，CPU offload 保留；该设置不改变模型实现、优化器分批或更新次数。
+动态前向的 CPU 合同已覆盖，真实 NPU 性能与显存验收以实际实验结果为准。
+它没有启用跨样本 packed attention；日志输出 `train/micro_batches_per_rank`、`train/input_tokens`、
+`train/padded_input_tokens` 和 `train/padding_fraction`，其中 token 计数跨 DP 累加，并计入所有 policy epochs。
+
 `rl/roles/model_setup.py` 只调用模型及优化器构建入口、冻结 Reference，不实现 Qwen3 的 forward 或并行切分。
 纯 TP 场景继续启用 size-one FSDP，以保留 checkpoint 布局和 TP-replicated 参数的梯度归约。
 
@@ -120,7 +154,7 @@ returns / values     [batch, tokens - 1] when required
 
 默认 internal 路径的 `RolloutManager` 将运行配置收敛为 `AgentRunner + GenerationSettings`。AgentRunner 负责：
 
-- 为每个 prompt/sample 建立稳定 row seed；
+- 配置 rollout seed 时，为每个 prompt/sample 建立稳定 row seed；
 - 驱动 single-turn 或 multi-turn `AgentSession`；
 - 调用环境、工具与 reward；
 - 将 observation/action 映射为 token-aligned turns；
@@ -176,6 +210,22 @@ sequenceDiagram
 4. 只有 publication transaction 成功，`SyncTrainer` 才把 step 提交为 V+1，并允许记录指标或 checkpoint。
 
 因此，训练进度代表“已经发布给 rollout 的策略”，而不是“Actor 曾经执行过一次 optimizer step”。
+
+普通 RL 默认使用 `train.old_log_prob_source=rollout`。显式设置为 `actor` 时，
+Trainer 在更新前重算并冻结训练侧概率，作为重要性比率的分母；原始采样概率继续保存在
+`rollout_log_probs` 中，便于诊断。仅开启日志诊断不会改变分母；OPD 仍保留其既有重算行为。
+内部 runner 使用 actor anchor 且关闭 consistency/OPD 时，可设置 `rollout.collect_log_probs=false`
+省去推理侧概率计算和传输；此时不报告 Actor 与 rollout 概率差异，不能把重算值冒充采样概率。
+该选项默认为 true。`rollout.seed` 控制逐轨迹稳定 seed；设为 null 时不向请求传入 seed，
+可用 `rollout.vllm.seed` 设置引擎随机状态。引擎级 seed 不保证改变请求调度后仍逐条复现回答。
+`rollout.vllm.disable_log_stats=true` 将统计开关传给 vLLM，默认 false；关闭后不能依赖其服务端性能统计。
+`rollout.vllm.task_queue_enable=1/2` 可单独设置推理子进程的 Ascend 算子下发队列等级；
+未配置时继承环境，设置此项不修改 Trainer 进程的队列模式。
+`evaluation.at_end=true` 可在最后一次策略发布后评估，而无需保存 checkpoint；默认值为 false。
+`evaluation.before_train=true` 在训练循环前评估当前策略（恢复时为恢复后的版本）；
+`evaluation.every_n_steps` 为正整数时独立于保存间隔触发验证，0 关闭周期验证，省略或 null 沿用保存边界。
+周期验证与末步验证重合时只执行一次。
+AdamW 的 `train.optimizer.no_decay_params` 默认为 `[bias, norm, ln_]`，显式空列表表示所有参数参与 decay。
 
 ## 状态所有权
 
@@ -316,3 +366,7 @@ CP/PP、更多 TP/EP 组合及动态专家重分配按实际任务需求推进�
 
 需要定位具体实现时，参阅 [模块导航](../../../docs/rl-navigation.md)、[PPO 配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml)
 和 [测试入口](../README.md#系统测试)。架构文档不重复维护函数级路径。
+
+公共 token 计数和优势/价值统计不依赖采样 log-prob 返回。
+缺少独立采样概率或未执行诊断前向时，只报告 `training/rollout_probs_diff_valid=0`，不构造概率差值；
+`training/total_tokens` 和对应吞吐继续按有效样本统计，排除 DP 补齐样本。

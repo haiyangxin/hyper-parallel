@@ -148,3 +148,73 @@ TP 和 consistency 脚本需先给出原来的 `colocated` 或 `disjoint` 位置
 SWE-Smith 与单轮 code 的直接训练命令则沿用 `train_rl.py` 接口。
 
 验收入口及边界见 [功能与验证说明](../../docs/moe_code_agent.md#系统测试)。
+
+## 与 verl 的单步对比
+
+[对比入口](scripts/run_verl_comparison_docker.sh)读取已完成的 verl 128 题 × 8 回答实验，
+从原始 parquet 找出同一批题目，再从基础 GRPO 配方生成 `/results/config.yaml`。
+使用本项目固定运行镜像，在 8 卡上训练 TP1、推理 TP2/DP4，完成一次更新及权重同步，默认关闭验证。
+
+```bash
+export VERL_BASELINE_RUN=/absolute/path/to/verl/completed-run
+bash hyper_parallel/rl/examples/gsm8k/scripts/run_verl_comparison_docker.sh
+```
+
+基准目录须包含 `rollouts/1.jsonl`。可通过 `HYPER_COMPARISON_MODEL`、`HYPER_COMPARISON_DATA`、
+`HYPER_COMPARISON_RESULTS` 指定模型、原始 GSM8K 数据和结果目录。
+生成配置设置每 rank 16 题、每题 8 回答、每 rank mini batch 128 条、一次更新、1024/1024 长度、
+Actor 重算 old log-prob、FP32 主参数、全参数 weight decay 0.01、学习率 1e-6、完整重计算。
+推理设置 `rollout.collect_log_probs=false`，省去采样概率返回；更新分母仍由 Actor 重算。
+`rollout.seed=null`、`rollout.vllm.seed=0` 使用引擎级随机状态，不承诺改变调度后仍逐条复现回答。
+`rollout.vllm.disable_log_stats=true` 关闭 vLLM 服务端逐 token 统计；训练日志仍保留，
+诊断服务端排队、prefill、decode 指标时须改为 false，并单独记录该开销。
+`rollout.vllm.task_queue_enable=2` 对齐 verl 推理侧的 Ascend 算子下发队列等级，仅作用于推理子进程。
+默认不执行验证、不保存 checkpoint。配置保留 1319 题、greedy、单回答和 1024-token 上限的验证参数；
+单独执行验证时须显式启用 `evaluation.enabled`，训练结束验证还须启用 `evaluation.at_end`。
+`evaluation.before_train=true` 在训练前验证当前策略；`evaluation.every_n_steps=10` 可独立于 checkpoint
+每 10 步验证。省略该间隔或设为 null 时沿用保存边界，设为 0 时关闭周期验证；末步验证不会重复。
+精度对照可将环境设为 `gsm8k_comparison_strict`，让训练与验证均采用 verl 严格奖励，默认数值奖励不变。
+
+训练沿用数值归一化 GSM8K 奖励；[对比环境](verl_reward.py)额外记录 verl 严格格式得分。
+每 rank 的 JSONL 同时记录训练和验证回答，`phase` 用于区分，验证补齐行须按题目去重。
+该对照配方默认采用共卡 CPU offload 和固定两条的 micro batch，verl 基准采用动态 token batch；
+框架、运行时版本和这些执行差异均须随性能结果披露。单步验证不代表长期收敛。
+
+### 训练角色驻留与梯度同步
+
+Qwen3 dense 的共卡 TP1 GRPO 可设置 `train.accelerator.cpu_offload: false`，
+让 Actor 分片、FP32 主参数和优化器状态常驻设备；设置 `reference_cpu_offload: true` 可单独保留 Reference offload。
+省略 Reference 覆盖时沿用 `cpu_offload`，现有 offload 配方行为不变。
+此模式要求关闭 consistency；Reward Model 共卡路径仍要求 CPU offload。
+
+`train.gradient_sync_each_micro_batch: true` 保留逐 microbatch 归约，适合单独测量驻留策略的影响。
+默认 false 时，无 offload 的 Actor 在 mini-batch 最后一次反向才同步；这会增加梯度驻留内存。
+两者都按既定 mini-batch 更新优化器，不改变问题数或每题回答数。
+实际可用容量须覆盖权重发布和推理唤醒阶段，不能仅参考训练进程的 allocator 峰值。
+框架在权重接收端确认加载后、唤醒 KV cache 前再次释放闲置缓存，避免发布临时缓存挤占推理空间。
+
+`train.accelerator.comm_fusion_zero_copy` 复用共享 FSDP 的 zero-copy 通信选项，省略/null 保留底层默认；
+设备常驻分片配合 `comm_fusion: true` 可避免重复输入打包。设置为 false 可单独对照该项收益。
+
+### Actor 动态 token 分批
+
+Qwen3 dense TP1 GRPO、consistency off 且未启用蒸馏时，可设置：
+
+```yaml
+train:
+  max_tokens_per_micro_batch: 3000
+```
+
+该值限制每卡每次 Actor 前反向的完整输入 token 数，包含 prompt、response 和批内 padding。
+省略或设为 null 恢复固定 `micro_batch_size`；old log-prob、Reference 前向仍沿用固定条数。
+动态模式保留原有问题数、回答数、optimizer mini-batch 成员及更新次数，兼容 CPU offload。
+各卡通过拆分分组对齐前反向次数；单条序列超预算时显式报错，不截断训练数据。
+调参时同时查看 `train/micro_batches_per_rank`、`train/padding_fraction`、Actor 耗时和显存峰值。
+此模式复用共享样本选择器与现有矩形模型输入，没有启用跨样本 packed attention。
+
+## 性能实验与远端运行
+
+[实验工作区](experiments/README.md)提供可迁移的 old/reference 单步对照工具、源码快照、
+设备监控和日志回读流程；[优化跟踪](experiments/optimization_tracking.md)汇总已验证收益、精度边界和待办。
+该工具保留 CPU offload 和概率返回开关，只在所选实验配方中关闭推理概率返回。
+历史50步结果早于采样修复；新动态前向的远端 NPU 验收仍待执行。

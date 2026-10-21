@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import gc
 import weakref
+from dataclasses import replace
 from types import MethodType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -38,6 +39,7 @@ from rl.roles import Actor
 from rl.trainer import SyncTrainer
 from rl.utils.monitoring.metrics import ActorUpdateMetrics
 
+from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
@@ -323,6 +325,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
         "reshard",
         "release",
         "update-weights",
+        "release",
         "prepare-rollout",
         "complete",
     ]
@@ -348,7 +351,24 @@ def test_trainer_publication_releases_training_state_before_rollout_wake(
 
     trainer._publish_policy(2)
 
-    assert calls == ["stream", "reshard", "release", "update", "wake"]
+    assert calls == ["stream", "reshard", "release", "update", "release", "wake"]
+
+
+def test_post_publication_release_failure_does_not_wake_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed cache release must not expose the pending policy or allocate rollout KV memory."""
+    trainer = object.__new__(SyncTrainer)
+    trainer.actor = SimpleNamespace(actor_model=object())
+    trainer.model_registration = SimpleNamespace(name="qwen")
+    trainer._reshard_model = Mock()
+    trainer._release_training_state_for_rollout = Mock(side_effect=[None, RuntimeError("cache release failed")])
+    trainer.rollout_engine = SimpleNamespace(update_weights=Mock(), prepare_for_rollout=Mock())
+    monkeypatch.setattr(trainer_module, "hsdp_sync_stream", lambda: None)
+
+    with pytest.raises(RuntimeError, match="cache release failed"):
+        trainer._publish_policy(2)
+
+    trainer.rollout_engine.update_weights.assert_called_once()
+    trainer.rollout_engine.prepare_for_rollout.assert_not_called()
 
 
 def test_trainer_completes_metrics_and_evaluation_after_published_step(
@@ -408,14 +428,17 @@ def test_trainer_completes_metrics_and_evaluation_after_published_step(
     assert calls == ["summarize", "metrics", "gate", "evaluate:1", "log:1"]
 
 
+@pytest.mark.parametrize("omit_sampling_probabilities", [False, True])
 def test_trainer_runs_one_complete_synchronous_training_step(
     monkeypatch: pytest.MonkeyPatch,
+    omit_sampling_probabilities: bool,
 ) -> None:
     """Production train and step methods complete one strongly synchronous publication."""
     calls: list[str] = []
     trainer = object.__new__(SyncTrainer)
     trainer.distillation_config = DistillationConfig()
     trainer._consistency_profile = "off"
+    trainer._old_log_prob_source = "actor" if omit_sampling_probabilities else "rollout"
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
     trainer.state = SimpleNamespace(global_step=0, max_steps=1, epoch=0)
     trainer.resolved_config = {
@@ -441,6 +464,9 @@ def test_trainer_runs_one_complete_synchronous_training_step(
     }
     trainer.train_dataloader = [batch]
     rollout = _rollout()
+    recomputed_log_probs = rollout.old_log_probs.clone()
+    if omit_sampling_probabilities:
+        rollout = replace(rollout, old_log_probs=None, rollout_log_probs=None)
     trainer.rollout_manager = SimpleNamespace(
         generate=lambda **_kwargs: calls.append("rollout") or rollout
     )
@@ -474,11 +500,17 @@ def test_trainer_runs_one_complete_synchronous_training_step(
         @staticmethod
         def compute_log_probs(experience: ExperienceBatch) -> torch.Tensor:
             calls.append("actor-logprobs")
-            return experience.old_log_probs.clone()
+            assert experience.sequences is rollout.sequences
+            return recomputed_log_probs.clone()
 
         @staticmethod
         def update(experience: ExperienceBatch) -> ActorUpdateMetrics:
-            assert experience is rollout
+            if omit_sampling_probabilities:
+                assert experience.rollout_log_probs is None
+                assert rollout.old_log_probs is None
+                torch.testing.assert_close(experience.old_log_probs, recomputed_log_probs)
+            else:
+                assert experience is rollout
             calls.append("actor-update")
             return ActorUpdateMetrics(0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 1.0, 0.01, 1, 1)
 
@@ -486,7 +518,7 @@ def test_trainer_runs_one_complete_synchronous_training_step(
         @staticmethod
         def compute_log_probs(experience: ExperienceBatch) -> torch.Tensor:
             calls.append("reference")
-            return torch.zeros_like(experience.old_log_probs)
+            return torch.zeros_like(experience.sequences[:, 1:], dtype=torch.float32)
 
     class Preparer:
         @staticmethod
@@ -1039,8 +1071,12 @@ def test_initial_rollout_release_retains_cpu_offload_validation(
         SyncTrainer._reshard_model(model)
 
 
+@pytest.mark.parametrize("reference_offload", [None, False, True])
+@pytest.mark.parametrize("token_budget", [None, 3000])
 def test_trainer_builds_required_models_optimizers_and_role_runtime(
     monkeypatch: pytest.MonkeyPatch,
+    reference_offload: bool | None,
+    token_budget: int | None,
 ) -> None:
     """GRPO construction creates independent trainable/reference models and Actor roles."""
     trainer = object.__new__(SyncTrainer)
@@ -1054,20 +1090,30 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
             "micro_batch_size": 1,
             "response_mini_batch_size": 2,
             "policy_update_epochs": 3,
+            "max_tokens_per_micro_batch": token_budget,
+            "old_log_prob_max_tokens_per_micro_batch": 4096,
+            "reference_log_prob_max_tokens_per_micro_batch": 8192,
         }
     }
     trainer.device = torch.device("cpu")
     trainer._dp_group_info = "dp-group"
     trainer.parallel_dims = SimpleNamespace(dp_size=2)
-    trainer.runtime_config = object()
-    trainer.distributed_setup = object()
+    trainer.runtime_config = SimpleNamespace(fsdp_config=SimpleNamespace(enable_offload=False))
+    trainer.distributed_setup = DistributedSetup(strategy_config=trainer.runtime_config.fsdp_config)
+    reference_runtime = SimpleNamespace(fsdp_config=SimpleNamespace(enable_offload=reference_offload))
+    if reference_offload is not None:
+        trainer.resolved_config["train"]["accelerator"] = {"reference_cpu_offload": reference_offload}
+    runtime_builder = Mock(return_value=reference_runtime)
+    monkeypatch.setattr(trainer_module, "build_runtime_config", runtime_builder)
+    setups = []
     trainable_model = torch.nn.Linear(2, 2)
     reference_model = torch.nn.Linear(2, 2)
     models = iter((trainable_model, reference_model))
     frozen_flags = []
 
     def build_model(unused_runtime: Any, unused_setup: Any, *, frozen: bool, cpu_threads: Any = None) -> Any:
-        del unused_runtime, unused_setup, cpu_threads
+        del unused_runtime, cpu_threads
+        setups.append(unused_setup)
         frozen_flags.append(frozen)
         return next(models)
 
@@ -1094,6 +1140,16 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
     trainer._build_models_and_optimizers()
 
     assert frozen_flags == [False, True]
+    assert setups[0] is trainer.distributed_setup
+    assert trainer.distributed_setup.strategy_config.enable_offload is False
+    assert setups[1].mesh_context is trainer.distributed_setup.mesh_context
+    if reference_offload is not None:
+        runtime_builder.assert_called_once_with(trainer.resolved_config, reference=True)
+        assert setups[1].strategy_config is reference_runtime.fsdp_config
+        assert setups[1] is not setups[0]
+    else:
+        runtime_builder.assert_not_called()
+        assert setups[1] is setups[0]
     assert actor_calls[0] == {
         "actor_model": trainable_model,
         "optimizer": optimizer,
@@ -1104,12 +1160,18 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
         "response_mini_batch_size": 2,
         "update_epochs": 3,
         "max_grad_norm": 2.0,
+        "gradient_sync_each_micro_batch": False,
+        "max_tokens_per_micro_batch": token_budget,
+        "log_prob_max_tokens_per_micro_batch": 4096,
         "distillation": None,
         "algorithm": trainer.algorithm,
         "micro_batch_size": 1,
     }
     assert actor_calls[1] == {
         "actor_model": reference_model,
+        "dp_group_info": "dp-group",
+        "dp_size": 2,
+        "log_prob_max_tokens_per_micro_batch": 8192,
         "algorithm": trainer.algorithm,
         "micro_batch_size": 1,
     }

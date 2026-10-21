@@ -21,7 +21,9 @@ Qwen3 adapter and explicit DistributedSetup declarations.
 
 from dataclasses import replace
 from functools import wraps
-from typing import Any
+from typing import Any, Optional
+
+from torch.nn import Parameter
 
 from hyper_parallel.distributed import ShardingPlanner, apply_sharding_plan
 # The atomic loader accepts these infrastructure objects at its build boundary.
@@ -101,10 +103,12 @@ class Qwen3ShardingPlanner(ShardingPlanner):
 class _Qwen3FSDP2Manager(FSDP2Manager):
     """Restore Qwen3 parameter identity at the existing FSDP entry boundary."""
 
-    def parallelize(self, model: Any, source_shard_info: Any = None) -> Any:
+    def parallelize(
+        self, model: Any, source_shard_info: Any = None, ignored_params: Optional[set[Parameter]] = None,
+    ) -> Any:
         """Retie this Qwen3 instance before the shared FSDP manager wraps it."""
         restore_tied_parameter(model)
-        return super().parallelize(model, source_shard_info=source_shard_info)
+        return super().parallelize(model, source_shard_info=source_shard_info, ignored_params=ignored_params)
 
 
 def apply_qwen3_sharding_plan(model: Any, *args: Any, **kwargs: Any) -> Any:

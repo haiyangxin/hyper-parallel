@@ -350,23 +350,25 @@ def test_runtime_adapter_does_not_patch_shared_code_or_other_models():
                         parameter_sharding._broadcast_tied_param, model_builder._move_model_to_device)
 
 
-def test_scoped_fsdp_retie_precedes_shared_manager(monkeypatch):
+@pytest.mark.parametrize("ignore_norm", [False, True])
+def test_scoped_fsdp_retie_precedes_shared_manager(monkeypatch, ignore_norm):
     """Shared FSDP sees one tied parameter; its own implementation is reused."""
     model = Qwen3ForCausalLM(tiny_config())
     model.lm_head.weight = torch.nn.Parameter(model.model.embed_tokens.weight.detach().clone())
     source_info = object()
+    ignored = {model.model.norm.weight} if ignore_norm else None
     received = []
 
-    def parallelize(unused_manager, value, source_shard_info=None):
+    def parallelize(unused_manager, value, source_shard_info=None, ignored_params=None):
         del unused_manager
         assert value.lm_head.weight is value.model.embed_tokens.weight
-        received.append(source_shard_info)
+        received.append((source_shard_info, ignored_params))
         return value
 
     monkeypatch.setattr(qwen3.FSDP2Manager, "parallelize", parallelize)
     manager = qwen3._Qwen3FSDP2Manager(FSDP2Config(), MeshContext())
-    assert manager.parallelize(model, source_info) is model
-    assert received == [source_info]
+    assert manager.parallelize(model, source_info, ignored_params=ignored) is model
+    assert received == [(source_info, ignored)]
 
 
 def test_scoped_runtime_rejects_other_model_families():
